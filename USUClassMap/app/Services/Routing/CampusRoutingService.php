@@ -4,7 +4,9 @@ namespace App\Services\Routing;
 
 use App\Models\Building;
 use App\Models\CampusRoutingOverride;
+use App\Models\Mongo\CampusRoutingGraph;
 use App\Models\PhotocopyPlace;
+use App\Services\Cache\CampusRedisService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -12,7 +14,7 @@ use Illuminate\Support\Facades\Schema;
 
 class CampusRoutingService
 {
-    private const CACHE_KEY_COMPILED = 'usu_campus_compiled_graph_v1';
+    private const CACHE_KEY_COMPILED = CampusRedisService::KEY_ROUTING_COMPILED_V2;
     private const WALKING_SPEED_M_PER_MIN = 75.0;  // 4.5 km/h
     private const DRIVING_SPEED_M_PER_MIN = 333.33; // 20.0 km/h
 
@@ -53,6 +55,7 @@ class CampusRoutingService
     {
         self::$memoryCompiledGraph = null;
         Cache::forget(self::CACHE_KEY_COMPILED);
+        app(CampusRedisService::class)->invalidateRoutingCache();
     }
 
     /**
@@ -680,6 +683,20 @@ class CampusRoutingService
      */
     public function loadBaseGraphJson(): array
     {
+        try {
+            $doc = CampusRoutingGraph::where('is_active', true)
+                ->orderByDesc('generated_at')
+                ->first();
+            if ($doc) {
+                $graph = $doc->toGraphArray();
+                if (!empty($graph['nodes']) && !empty($graph['edges'])) {
+                    return $graph;
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('CampusRoutingService MongoDB load fallback to JSON: ' . $e->getMessage());
+        }
+
         foreach ([$this->graphBuilder->getRuntimeGraphPath(), $this->graphBuilder->getSnapshotGraphPath()] as $path) {
             if (is_file($path)) {
                 $raw = @file_get_contents($path);

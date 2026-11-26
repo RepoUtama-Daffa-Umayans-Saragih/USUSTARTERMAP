@@ -3,6 +3,7 @@
 namespace App\Models\Concerns;
 
 use App\Support\CatalogBehaviorClassifier;
+use Illuminate\Database\Eloquent\Builder;
 
 trait HasCatalogAttributes
 {
@@ -77,5 +78,36 @@ trait HasCatalogAttributes
             'image_url' => $this->image_url,
             'is_available' => (bool) $this->is_available,
         ], CatalogBehaviorClassifier::metadataForItem($this));
+    }
+
+    public function scopeSearchTrigram(Builder $query, string $keyword): Builder
+    {
+        $term = trim($keyword);
+        if ($term === '') {
+            return $query;
+        }
+
+        $like = "%{$term}%";
+        $table = $query->getModel()->getTable();
+
+        if ($query->getConnection()->getDriverName() === 'pgsql') {
+            return $query->where(function (Builder $sub) use ($table, $term, $like): void {
+                $sub->whereRaw("{$table}.search_vector @@ plainto_tsquery('indonesian', unaccent(?))", [$term])
+                    ->orWhereRaw("{$table}.name % ?", [$term])
+                    ->orWhere("{$table}.name", 'ilike', $like)
+                    ->orWhere("{$table}.brand", 'ilike', $like)
+                    ->orWhere("{$table}.sub_category", 'ilike', $like)
+                    ->orWhere("{$table}.category", 'ilike', $like)
+                    ->orWhere("{$table}.description", 'ilike', $like);
+            });
+        }
+
+        return $query->where(function (Builder $sub) use ($table, $like): void {
+            $sub->whereSearchLike("{$table}.name", $like)
+                ->orWhereSearchLike("{$table}.brand", $like)
+                ->orWhereSearchLike("{$table}.sub_category", $like)
+                ->orWhereSearchLike("{$table}.category", $like)
+                ->orWhereSearchLike("{$table}.description", $like);
+        });
     }
 }

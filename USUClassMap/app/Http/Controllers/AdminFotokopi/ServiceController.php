@@ -7,6 +7,7 @@ use App\Models\FotocopyService;
 use App\Models\FotocopyStore;
 use App\Models\PhotocopyItem;
 use App\Models\PhotocopyPlace;
+use App\Services\Cache\CampusRedisService;
 use App\Services\Fotocopy\StoreMapSyncService;
 use Illuminate\Http\Request;
 
@@ -68,10 +69,10 @@ class ServiceController extends Controller
         if ($request->filled('q')) {
             $q = $request->input('q');
             $query->where(function ($sq) use ($q) {
-                $sq->where('name', 'like', "%{$q}%")
-                    ->orWhere('description', 'like', "%{$q}%")
-                    ->orWhere('brand', 'like', "%{$q}%")
-                    ->orWhere('sub_category', 'like', "%{$q}%");
+                $sq->whereSearchLike('name', "%{$q}%")
+                    ->orWhereSearchLike('description', "%{$q}%")
+                    ->orWhereSearchLike('brand', "%{$q}%")
+                    ->orWhereSearchLike('sub_category', "%{$q}%");
             });
         }
 
@@ -288,6 +289,7 @@ class ServiceController extends Controller
         }
 
         $service->delete();
+        app(CampusRedisService::class)->invalidatePhotocopyCaches();
 
         return redirect()->route('admin-fotokopi.services.index')
             ->with('success', "Layanan '{$name}' berhasil dihapus dari katalog.");

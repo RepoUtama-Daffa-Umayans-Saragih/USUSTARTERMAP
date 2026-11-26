@@ -7,6 +7,7 @@ use App\Models\FotocopyStore;
 use App\Models\PhotocopyPlace;
 use App\Models\User;
 use App\Models\WhatsappDispatchLog;
+use App\Services\Cache\CampusRedisService;
 use App\Services\Fotocopy\StoreMapSyncService;
 use App\Services\WhatsApp\WhatsAppManager;
 use App\Support\WhatsAppPhoneNormalizer;
@@ -44,9 +45,9 @@ class StoreController extends Controller
         if ($request->filled('q')) {
             $q = $request->input('q');
             $query->where(function ($sub) use ($q) {
-                $sub->where('name', 'like', "%{$q}%")
-                    ->orWhere('location_name', 'like', "%{$q}%")
-                    ->orWhere('whatsapp', 'like', "%{$q}%");
+                $sub->whereSearchLike('name', "%{$q}%")
+                    ->orWhereSearchLike('location_name', "%{$q}%")
+                    ->orWhereSearchLike('whatsapp', "%{$q}%");
             });
         }
 
@@ -325,6 +326,7 @@ class StoreController extends Controller
         }
 
         $store->delete();
+        app(CampusRedisService::class)->invalidatePhotocopyCaches();
 
         return redirect()->route('admin-fotokopi.stores.index')
             ->with('success', "Mitra toko '{$name}' berhasil dihapus.");

@@ -3,6 +3,7 @@
 namespace App\Services\Routing;
 
 use App\Models\Building;
+use App\Models\Mongo\CampusRoutingGraph;
 use App\Models\PhotocopyPlace;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -71,8 +72,28 @@ class CampusGraphBuilderService
 
         $this->saveJson($this->getRuntimeGraphPath(), $graphData);
         $this->saveJson($this->getSnapshotGraphPath(), $graphData);
+        $this->persistToMongo($graphData);
 
         return $graphData;
+    }
+
+    public function persistToMongo(array $graphData): void
+    {
+        try {
+            $version = (int) ($graphData['version'] ?? 1);
+            $payload = CampusRoutingGraph::fromGraphArray($graphData, true);
+
+            CampusRoutingGraph::where('version', '!=', $version)
+                ->where('is_active', true)
+                ->update(['is_active' => false]);
+
+            CampusRoutingGraph::updateOrCreate(
+                ['version' => $version],
+                $payload
+            );
+        } catch (\Throwable $e) {
+            Log::warning('CampusGraphBuilder: gagal menyimpan graf ke MongoDB: ' . $e->getMessage());
+        }
     }
 
     /**

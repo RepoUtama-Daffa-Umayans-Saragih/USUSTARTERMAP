@@ -7,6 +7,7 @@ use App\Services\Payment\Services\QrCodeSvgGenerator;
 use App\Services\Pdf\PdfMetadataInspectorService;
 use App\Support\WhatsAppPhoneNormalizer;
 use Barryvdh\DomPDF\Facade\Pdf;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -97,6 +98,10 @@ class OrderInvoiceService
 
     protected function generateUniqueInvoiceNumber(): string
     {
+        if (DB::getDriverName() === 'pgsql') {
+            return (string) DB::selectOne('SELECT fn_generate_invoice_number() AS inv')->inv;
+        }
+
         do {
             $candidate = 'INV-' . date('Ymd') . '-' . strtoupper(Str::random(4));
         } while (FotocopyOrder::where('invoice_number', $candidate)->exists());

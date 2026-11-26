@@ -2,8 +2,10 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\HasSpatialScopes;
 use App\Services\OperationalStatusService;
 use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
@@ -12,6 +14,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class PhotocopyPlace extends Model
 {
     use HasFactory;
+    use HasSpatialScopes;
 
     protected $table = 'photocopy_places';
 
@@ -286,5 +289,34 @@ class PhotocopyPlace extends Model
         }
 
         return "https://facebook.com/" . trim($this->facebook);
+    }
+
+    public function scopeSearchTrigram(Builder $query, string $keyword): Builder
+    {
+        $term = trim($keyword);
+        if ($term === '') {
+            return $query;
+        }
+
+        $like = "%{$term}%";
+
+        if ($query->getConnection()->getDriverName() === 'pgsql') {
+            return $query->where(function (Builder $sub) use ($term, $like): void {
+                $sub->whereRaw(
+                    "to_tsvector('indonesian', coalesce(photocopy_places.name, '') || ' ' || coalesce(photocopy_places.location_name, '') || ' ' || coalesce(photocopy_places.description, '')) @@ plainto_tsquery('indonesian', ?)",
+                    [$term]
+                )
+                    ->orWhereRaw('photocopy_places.name % ?', [$term])
+                    ->orWhere('photocopy_places.name', 'ilike', $like)
+                    ->orWhere('photocopy_places.location_name', 'ilike', $like)
+                    ->orWhere('photocopy_places.description', 'ilike', $like);
+            });
+        }
+
+        return $query->where(function (Builder $sub) use ($like): void {
+            $sub->whereSearchLike('name', $like)
+                ->orWhereSearchLike('location_name', $like)
+                ->orWhereSearchLike('description', $like);
+        });
     }
 }

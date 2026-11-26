@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: usuclassmap-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-usuclassmap}
+      POSTGRES_USER: ${DB_USERNAME:-usuclassmap}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-usuclassmap_secret}
+      TZ: Asia/Jakarta
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/01-init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-usuclassmap} -d ${DB_DATABASE:-usuclassmap}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:7
+    container_name: usuclassmap-mongodb
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Jakarta
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: usuclassmap-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fuseki:
+    image: stain/jena-fuseki
+    container_name: usuclassmap-fuseki-tdb2
+    restart: unless-stopped
+    environment:
+      ADMIN_PASSWORD: ${FUSEKI_PASSWORD:-admin}
+      TDB: "2"
+      FUSEKI_DATASET_1: ${FUSEKI_DATASET:-usuclassmap}
+    ports:
+      - "${FUSEKI_PORT:-3030}:3030"
+    volumes:
+      - fusekidata:/fuseki
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3030/$$/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  pgdata:
+  mongodata:
+  redisdata:
+  fusekidata:

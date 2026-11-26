@@ -33,5 +33,9 @@
         <env name="TELESCOPE_ENABLED" value="false"/>
         <env name="SPARQL_TIMEOUT" value="1"/>
         <env name="FUSEKI_URL" value="http://127.0.0.1:3030"/>
+        <env name="FUSEKI_SYNC_ENABLED" value="false"/>
+        <env name="MONGODB_DATABASE" value="usuclassmap_doc_test"/>
+        <env name="REDIS_DB" value="5"/>
+        <env name="REDIS_CACHE_DB" value="6"/>
     </php>
 </phpunit>

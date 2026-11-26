@@ -30,17 +30,19 @@ class CopyShopApiController extends Controller
             ));
 
             $query->where(function ($q) use ($trimSearch, $compactSearch, $tokens) {
-                $q->where('name', 'like', "%{$trimSearch}%")
-                    ->orWhere('location_name', 'like', "%{$trimSearch}%")
-                    ->orWhere('description', 'like', "%{$trimSearch}%")
-                    ->orWhere('slug', 'like', "%{$trimSearch}%");
+                $likeOperator = $q->getModel()->getConnection()->getDriverName() === 'pgsql' ? 'ILIKE' : 'LIKE';
+
+                $q->whereSearchLike('name', "%{$trimSearch}%")
+                    ->orWhereSearchLike('location_name', "%{$trimSearch}%")
+                    ->orWhereSearchLike('description', "%{$trimSearch}%")
+                    ->orWhereSearchLike('slug', "%{$trimSearch}%");
 
                 if (strlen($compactSearch) >= 4) {
                     $q->orWhereRaw(
-                        "LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(name, ' ', ''), '-', ''), '(', ''), ')', ''), '&', '')) LIKE ?",
+                        "LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(name, ' ', ''), '-', ''), '(', ''), ')', ''), '&', '')) {$likeOperator} ?",
                         ["%{$compactSearch}%"]
                     )->orWhereRaw(
-                        "LOWER(REPLACE(slug, '-', '')) LIKE ?",
+                        "LOWER(REPLACE(slug, '-', '')) {$likeOperator} ?",
                         ["%{$compactSearch}%"]
                     );
                 }
@@ -49,10 +51,10 @@ class CopyShopApiController extends Controller
                     $q->orWhere(function ($tokenGroup) use ($tokens) {
                         foreach ($tokens as $token) {
                             $tokenGroup->where(function ($sub) use ($token) {
-                                $sub->where('name', 'like', "%{$token}%")
-                                    ->orWhere('location_name', 'like', "%{$token}%")
-                                    ->orWhere('description', 'like', "%{$token}%")
-                                    ->orWhere('slug', 'like', "%{$token}%");
+                                $sub->whereSearchLike('name', "%{$token}%")
+                                    ->orWhereSearchLike('location_name', "%{$token}%")
+                                    ->orWhereSearchLike('description', "%{$token}%")
+                                    ->orWhereSearchLike('slug', "%{$token}%");
                             });
                         }
                     });

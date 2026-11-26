@@ -24,6 +24,8 @@ return [
 
     'timeout' => env('SPARQL_TIMEOUT', 15), // in seconds
 
+    'auto_sync' => filter_var(env('FUSEKI_SYNC_ENABLED', true), FILTER_VALIDATE_BOOLEAN),
+
     'namespaces' => [
         'usu' => 'http://usuclassmap.usu.ac.id/ontology#',
         'rdf' => 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',

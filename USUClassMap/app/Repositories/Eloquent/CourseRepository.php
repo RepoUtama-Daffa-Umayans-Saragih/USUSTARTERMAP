@@ -18,8 +18,8 @@ class CourseRepository extends BaseRepository implements CourseRepositoryInterfa
 
         if ($keyword) {
             $query->where(function ($q) use ($keyword) {
-                $q->where('name', 'like', "%{$keyword}%")
-                  ->orWhere('code', 'like', "%{$keyword}%");
+                $q->whereSearchLike('name', "%{$keyword}%")
+                  ->orWhereSearchLike('code', "%{$keyword}%");
             });
         }
 

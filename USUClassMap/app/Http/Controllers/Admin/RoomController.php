@@ -7,6 +7,7 @@ use App\Http\Requests\Admin\RoomRequest;
 use App\Jobs\RegenerateRdfJob;
 use App\Models\Building;
 use App\Models\Room;
+use App\Services\Cache\CampusRedisService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 
@@ -19,9 +20,9 @@ class RoomController extends Controller
         if ($request->filled('q')) {
             $search = $request->q;
             $query->where(function ($q) use ($search) {
-                $q->where('name', 'like', "%{$search}%")
+                $q->whereSearchLike('name', "%{$search}%")
                   ->orWhereHas('building', function ($q) use ($search) {
-                      $q->where('name', 'like', "%{$search}%");
+                      $q->whereSearchLike('name', "%{$search}%");
                   });
             });
         }
@@ -49,6 +50,7 @@ class RoomController extends Controller
         }
 
         Room::create($data);
+        app(CampusRedisService::class)->invalidateBuildingCaches();
         RegenerateRdfJob::dispatch();
 
         return redirect()->route('admin.rooms.index')
@@ -77,6 +79,7 @@ class RoomController extends Controller
         }
 
         $room->update($data);
+        app(CampusRedisService::class)->invalidateBuildingCaches();
         RegenerateRdfJob::dispatch();
 
         return redirect()->route('admin.rooms.index')
@@ -89,6 +92,7 @@ class RoomController extends Controller
             Storage::disk('public')->delete($room->photo_360_path);
         }
         $room->delete();
+        app(CampusRedisService::class)->invalidateBuildingCaches();
         RegenerateRdfJob::dispatch();
 
         return redirect()->route('admin.rooms.index')

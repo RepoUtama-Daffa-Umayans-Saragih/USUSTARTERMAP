@@ -2,6 +2,8 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\HasSpatialScopes;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
@@ -9,6 +11,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class Building extends Model
 {
     use HasFactory;
+    use HasSpatialScopes;
 
     protected $fillable = [
         'name',
@@ -51,5 +54,30 @@ class Building extends Model
     public function rooms(): HasMany
     {
         return $this->hasMany(Room::class);
+    }
+
+    public function scopeSearchTrigram(Builder $query, string $keyword): Builder
+    {
+        $term = trim($keyword);
+        if ($term === '') {
+            return $query;
+        }
+
+        $like = "%{$term}%";
+
+        if ($query->getConnection()->getDriverName() === 'pgsql') {
+            return $query->where(function (Builder $sub) use ($term, $like): void {
+                $sub->whereRaw('buildings.name % ?', [$term])
+                    ->orWhere('buildings.name', 'ilike', $like)
+                    ->orWhere('buildings.code', 'ilike', $like)
+                    ->orWhere('buildings.faculty', 'ilike', $like);
+            });
+        }
+
+        return $query->where(function (Builder $sub) use ($like): void {
+            $sub->whereSearchLike('name', $like)
+                ->orWhereSearchLike('code', $like)
+                ->orWhereSearchLike('faculty', $like);
+        });
     }
 }

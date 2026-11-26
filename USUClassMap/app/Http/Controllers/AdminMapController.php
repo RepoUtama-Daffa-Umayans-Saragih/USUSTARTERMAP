@@ -11,6 +11,7 @@ use App\Models\PhotocopyPlace;
 use App\Models\Room;
 use App\Models\RoomMedia;
 use App\Models\Schedule;
+use App\Services\Cache\CampusRedisService;
 use App\Services\GitSnapshotSyncService;
 use App\Services\Routing\CampusGraphBuilderService;
 use App\Services\Routing\CampusRoutingService;
@@ -68,6 +69,8 @@ class AdminMapController extends Controller
 
         try {
             $building = Building::create($request->all());
+            app(CampusRedisService::class)->invalidateBuildingCaches();
+            app(CampusRedisService::class)->syncBuildingsGeo();
             RegenerateRdfJob::dispatch();
             return response()->json([
                 'success' => true,
@@ -108,6 +111,7 @@ class AdminMapController extends Controller
         try {
             $room = Room::create($request->all());
             $room->load('building');
+            app(CampusRedisService::class)->invalidateBuildingCaches();
             RegenerateRdfJob::dispatch();
 
             return response()->json([
@@ -187,6 +191,7 @@ class AdminMapController extends Controller
             ]);
 
             $schedule->load(['course', 'lecturer', 'room.building']);
+            app(CampusRedisService::class)->invalidateBuildingCaches();
 
             return response()->json([
                 'success' => true,
@@ -255,6 +260,8 @@ class AdminMapController extends Controller
             $building->update($request->only([
                 'name', 'code', 'faculty', 'latitude', 'longitude', 'description', 'floor_count'
             ]));
+            app(CampusRedisService::class)->invalidateBuildingCaches();
+            app(CampusRedisService::class)->syncBuildingsGeo();
             RegenerateRdfJob::dispatch();
 
             return response()->json([
@@ -296,6 +303,7 @@ class AdminMapController extends Controller
         try {
             $room->update($request->only(['building_id', 'name', 'floor', 'capacity']));
             $room->load('building');
+            app(CampusRedisService::class)->invalidateBuildingCaches();
             RegenerateRdfJob::dispatch();
 
             return response()->json([
@@ -381,6 +389,8 @@ class AdminMapController extends Controller
                 $room->update(['photo_360_path' => $path]);
             }
 
+            app(CampusRedisService::class)->invalidateBuildingCaches();
+
             return response()->json([
                 'success' => true,
                 'message' => 'Media ' . strtoupper($request->type) . ' berhasil diunggah!',
@@ -416,6 +426,8 @@ class AdminMapController extends Controller
             $media->metadata = $metadata;
             $media->save();
 
+            app(CampusRedisService::class)->invalidateBuildingCaches();
+
             return response()->json([
                 'success' => true,
                 'message' => 'Konfigurasi hotspot 360° berhasil disimpan!',
@@ -439,6 +451,7 @@ class AdminMapController extends Controller
             }
 
             $media->delete();
+            app(CampusRedisService::class)->invalidateBuildingCaches();
 
             return response()->json([
                 'success' => true,
@@ -635,6 +648,14 @@ class AdminMapController extends Controller
         $entity->entrance_lng = $lng !== null ? (float) $lng : null;
         $entity->save();
 
+        $redis = app(CampusRedisService::class);
+        if ($entityType === 'building') {
+            $redis->invalidateBuildingCaches();
+            $redis->syncBuildingsGeo();
+        } else {
+            $redis->invalidatePhotocopyCaches();
+            $redis->syncPlacesGeo();
+        }
         $routingService->invalidateCache();
 
         return response()->json([
@@ -663,7 +684,7 @@ class AdminMapController extends Controller
         try {
             $graph = $builder->buildAndSave(fromSnapshot: !$request->boolean('live', false));
             $routingService->invalidateCache();
-            $gitSync->exportSnapshot();
+            $gitSync->exportAll(false);
 
             return response()->json([
                 'success' => true,

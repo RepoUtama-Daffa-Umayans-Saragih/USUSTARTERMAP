@@ -3,8 +3,12 @@
 namespace App\Services\Fotocopy;
 
 use App\Jobs\DispatchOrderToWhatsAppJob;
+use App\Jobs\RefreshMsbdMaterializedViewsJob;
 use App\Models\FotocopyOrder;
+use App\Services\Cache\CampusRedisService;
 use App\Services\Invoice\OrderInvoiceService;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class OrderPaymentFulfillmentService
 {
@@ -20,21 +24,35 @@ class OrderPaymentFulfillmentService
      */
     public function handlePaidOrder(FotocopyOrder $order, bool $dispatchWhatsApp = true): void
     {
-        if (!$order->isPaid()) {
-            return;
-        }
+        app(CampusRedisService::class)->withOrderPaymentLock(
+            (string) $order->order_code,
+            function () use ($order, $dispatchWhatsApp): void {
+                $fresh = $order->fresh();
+                if (!$fresh || !$fresh->isPaid()) {
+                    return;
+                }
 
-        $this->invoiceService->generateForOrder($order);
+                $this->invoiceService->generateForOrder($fresh);
 
-        if ($dispatchWhatsApp && !$order->isWaDispatched() && class_exists(DispatchOrderToWhatsAppJob::class)) {
-            $order->wa_dispatch_status = 'queued';
-            $order->save();
+                if ($dispatchWhatsApp && !$fresh->isWaDispatched() && class_exists(DispatchOrderToWhatsAppJob::class)) {
+                    $fresh->wa_dispatch_status = 'queued';
+                    $fresh->save();
 
-            if (config('whatsapp.sync_dispatch', true)) {
-                DispatchOrderToWhatsAppJob::dispatchSync($order->id);
-            } else {
-                DispatchOrderToWhatsAppJob::dispatch($order->id);
+                    if (config('whatsapp.sync_dispatch', true)) {
+                        DispatchOrderToWhatsAppJob::dispatchSync($fresh->id);
+                    } else {
+                        DispatchOrderToWhatsAppJob::dispatch($fresh->id);
+                    }
+                }
+
+                if (DB::getDriverName() === 'pgsql') {
+                    try {
+                        RefreshMsbdMaterializedViewsJob::dispatch('revenue');
+                    } catch (\Throwable $e) {
+                        Log::debug('OrderPaymentFulfillmentService MV refresh skipped: ' . $e->getMessage());
+                    }
+                }
             }
-        }
+        );
     }
 }

@@ -792,17 +792,17 @@ SPARQL;
                 foreach ($tokens as $token) {
                     $condition = function ($sub) use ($token) {
                         $sub->whereHas('course', function ($c) use ($token) {
-                            $c->where('name', 'like', "%{$token}%")
-                              ->orWhere('code', 'like', "%{$token}%");
+                            $c->whereSearchLike('name', "%{$token}%")
+                              ->orWhereSearchLike('code', "%{$token}%");
                         })
                         ->orWhereHas('lecturer', function ($l) use ($token) {
-                            $l->where('name', 'like', "%{$token}%");
+                            $l->whereSearchLike('name', "%{$token}%");
                         })
                         ->orWhereHas('room', function ($r) use ($token) {
-                            $r->where('name', 'like', "%{$token}%")
+                            $r->whereSearchLike('name', "%{$token}%")
                               ->orWhereHas('building', function ($b) use ($token) {
-                                  $b->where('name', 'like', "%{$token}%")
-                                    ->orWhere('code', 'like', "%{$token}%");
+                                  $b->whereSearchLike('name', "%{$token}%")
+                                    ->orWhereSearchLike('code', "%{$token}%");
                               });
                         });
                     };

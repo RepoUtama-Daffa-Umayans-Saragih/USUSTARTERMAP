@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Mongo\AiCopilotSession;
 use App\Services\AiCopilotService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -58,7 +59,28 @@ class AiCopilotController extends Controller
                 'user_context' => $validated['user_context'] ?? [],
             ];
 
+            $startedAt = microtime(true);
             $result = $this->copilotService->chat($userMessage, $history, $runtimeContext);
+            $latencyMs = max(0, (int) round((microtime(true) - $startedAt) * 1000));
+
+            $sessionToken = trim((string) ($request->input('session_token')
+                ?: ($request->hasSession() ? $request->session()->getId() : '')
+                ?: ('anon_' . sha1((string) ($request->user()?->id ?? $request->ip() ?? 'cli')))));
+
+            try {
+                AiCopilotSession::recordTurn($sessionToken, optional($request->user())->id, [
+                    'prompt' => $userMessage,
+                    'reply' => (string) ($result['reply'] ?? ''),
+                    'intent' => (string) ($result['intent'] ?? 'general_campus_qa'),
+                    'tool_calls' => $this->copilotService->getLastToolCalls(),
+                    'latency_ms' => $latencyMs,
+                    'provider' => (string) ($result['grounded_source'] ?? 'local_grounded'),
+                    'current_page' => $runtimeContext['current_page'],
+                    'recorded_at' => now()->toIso8601String(),
+                ]);
+            } catch (\Throwable $mongoEx) {
+                Log::warning('[AiCopilotController] MongoDB session turn telemetry skipped: ' . $mongoEx->getMessage());
+            }
 
             return response()->json([
                 'status'          => 'success',

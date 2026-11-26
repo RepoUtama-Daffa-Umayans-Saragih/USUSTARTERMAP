@@ -3,11 +3,13 @@
 namespace App\Jobs;
 
 use App\Models\FotocopyOrder;
+use App\Models\Mongo\WhatsappDispatchEvent;
 use App\Models\WhatsappDispatchLog;
 use App\Services\WhatsApp\WhatsAppManager;
 use App\Services\WhatsApp\WhatsAppPayloadFormatter;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Log;
 
 class SendCustomerReadyNotificationJob implements ShouldQueue
 {
@@ -18,6 +20,7 @@ class SendCustomerReadyNotificationJob implements ShouldQueue
 
     public function __construct(public int $orderId)
     {
+        $this->onQueue('whatsapp');
     }
 
     public function handle(WhatsAppManager $waManager, WhatsAppPayloadFormatter $formatter): void
@@ -43,8 +46,10 @@ class SendCustomerReadyNotificationJob implements ShouldQueue
         }
 
         $driver = $waManager->driver();
+        $driverName = $driver->driverName();
         $message = $formatter->formatCustomerReadyMessage($order);
         $res = $driver->sendText($customerWa, $message);
+        $status = ($res['success'] ?? false) ? 'sent' : 'failed';
 
         WhatsappDispatchLog::create([
             'fotocopy_order_id' => $order->id,
@@ -53,12 +58,31 @@ class SendCustomerReadyNotificationJob implements ShouldQueue
             'message_type' => 'status_update',
             'payload_json' => ['text' => $message],
             'attachment_path' => null,
-            'driver' => $driver->driverName(),
+            'driver' => $driverName,
             'external_message_id' => $res['external_message_id'] ?? null,
-            'status' => ($res['success'] ?? false) ? 'sent' : 'failed',
+            'status' => $status,
             'attempts' => max(1, (int) $this->attempts()),
             'error_message' => $res['error'] ?? null,
             'sent_at' => ($res['success'] ?? false) ? now() : null,
         ]);
+
+        try {
+            WhatsappDispatchEvent::create([
+                'order_id' => $order->id,
+                'order_code' => $order->order_code,
+                'driver' => $driverName,
+                'recipient' => $customerWa,
+                'status' => $status,
+                'payload' => [
+                    'recipient_role' => 'customer',
+                    'message_type' => 'status_update',
+                    'text' => $message,
+                ],
+                'raw_response' => $res,
+                'expires_at' => now()->addDays(WhatsappDispatchEvent::TTL_DAYS),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('SendCustomerReadyNotificationJob MongoDB telemetry skipped: ' . $e->getMessage());
+        }
     }
 }

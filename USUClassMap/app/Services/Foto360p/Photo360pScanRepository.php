@@ -2,14 +2,38 @@
 
 namespace App\Services\Foto360p;
 
+use App\Models\Mongo\Photo360pScan;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use MongoDB\BSON\UTCDateTime;
+use MongoDB\Operation\FindOneAndUpdate;
 use RuntimeException;
 
 class Photo360pScanRepository
 {
+    public function __construct(
+        protected ?string $customStoragePath = null
+    ) {
+    }
+
     public function storageDir(): string
     {
-        return rtrim((string) config('foto360p.storage_path', storage_path('app/foto-360p')), '/\\');
+        $raw = $this->customStoragePath ?? config('foto360p.storage_path', storage_path('app/foto-360p'));
+
+        return rtrim((string) $raw, '/\\');
+    }
+
+    public function isUsingDefaultStorage(): bool
+    {
+        if ($this->customStoragePath !== null) {
+            return false;
+        }
+
+        $current = str_replace('\\', '/', rtrim($this->storageDir(), '/\\'));
+        $default = str_replace('\\', '/', rtrim(storage_path('app/foto-360p'), '/\\'));
+
+        return strcasecmp($current, $default) === 0;
     }
 
     public function path(string $file): string
@@ -38,65 +62,47 @@ class Photo360pScanRepository
      */
     public function load(): array
     {
+        if ($this->isUsingDefaultStorage()) {
+            $mongoPayload = $this->loadFromMongo();
+            if ($mongoPayload !== null) {
+                return $mongoPayload;
+            }
+        }
+
         $scanPath = $this->path('scan_results.json');
         if (is_file($scanPath)) {
             $raw = file_get_contents($scanPath);
             $decoded = is_string($raw) ? json_decode($raw, true) : null;
             if (is_array($decoded) && isset($decoded['items']) && is_array($decoded['items'])) {
-                return $this->normalizePayload($decoded);
+                $normalized = $this->normalizePayload($decoded);
+                if ($this->isUsingDefaultStorage()) {
+                    $this->persistAllToMongo($normalized);
+                }
+
+                return $normalized;
             }
         }
 
-        return $this->normalizePayload($this->buildFallbackPayload());
+        $fallback = $this->normalizePayload($this->buildFallbackPayload());
+        if ($this->isUsingDefaultStorage() && !empty($fallback['items'])) {
+            $this->persistAllToMongo($fallback);
+        }
+
+        return $fallback;
     }
 
     /**
-     * Atomically write scan_results.json guarded by an exclusive flock.
+     * Atomically persist scan payload to MongoDB (when default storage) and scan_results.json guarded by flock.
      *
      * @param array<string, mixed> $data
      */
     public function save(array $data): void
     {
-        $dir = $this->storageDir();
-        if (!is_dir($dir)) {
-            mkdir($dir, 0775, true);
-        }
+        $normalized = $this->normalizePayload($data);
+        $this->writePayloadToDisk($normalized);
 
-        $lockPath = $this->path('.lock');
-        $lockHandle = fopen($lockPath, 'c+');
-        if ($lockHandle === false) {
-            throw new RuntimeException("Unable to open lock file at {$lockPath}");
-        }
-
-        try {
-            if (!flock($lockHandle, LOCK_EX)) {
-                throw new RuntimeException("Unable to acquire flock on {$lockPath}");
-            }
-
-            $normalized = $this->normalizePayload($data);
-            $json = json_encode($normalized, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            if ($json === false) {
-                throw new RuntimeException('Failed to encode scan_results.json');
-            }
-
-            $targetPath = $this->path('scan_results.json');
-            $tmpPath = $this->path('scan_results.json.tmp.' . uniqid('', true));
-
-            if (file_put_contents($tmpPath, $json) === false) {
-                throw new RuntimeException("Failed to write temp scan file {$tmpPath}");
-            }
-
-            if (!@rename($tmpPath, $targetPath)) {
-                if (@copy($tmpPath, $targetPath)) {
-                    @unlink($tmpPath);
-                } else {
-                    @unlink($tmpPath);
-                    throw new RuntimeException("Failed to move {$tmpPath} to {$targetPath}");
-                }
-            }
-        } finally {
-            @flock($lockHandle, LOCK_UN);
-            @fclose($lockHandle);
+        if ($this->isUsingDefaultStorage()) {
+            $this->persistAllToMongo($normalized);
         }
     }
 
@@ -105,6 +111,17 @@ class Photo360pScanRepository
      */
     public function findItem(int $id): ?array
     {
+        if ($this->isUsingDefaultStorage()) {
+            try {
+                $doc = Photo360pScan::where('photo_id', $id)->first();
+                if ($doc) {
+                    return $this->normalizeItem($doc->toScanItem());
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Photo360pScanRepository MongoDB findItem fallback: ' . $e->getMessage());
+            }
+        }
+
         $payload = $this->load();
         foreach ($payload['items'] as $item) {
             if ((int) ($item['id'] ?? 0) === $id) {
@@ -137,11 +154,157 @@ class Photo360pScanRepository
             return null;
         }
 
-        $updated = array_merge($payload['items'][$foundIndex], $patch);
-        $payload['items'][$foundIndex] = $this->normalizeItem($updated);
-        $this->save($payload);
+        $updated = $this->normalizeItem(array_merge($payload['items'][$foundIndex], $patch));
+        $payload['items'][$foundIndex] = $updated;
+        $this->writePayloadToDisk($payload);
 
-        return $payload['items'][$foundIndex];
+        if ($this->isUsingDefaultStorage()) {
+            try {
+                $docData = Photo360pScan::fromScanItem($updated, [
+                    'scan_engine' => $payload['scan_engine'] ?? 'unknown',
+                    'generated_at' => $payload['generated_at'] ?? null,
+                ]);
+                unset($docData['verification_history']);
+
+                $now = new UTCDateTime(now());
+                DB::connection('mongodb')
+                    ->getCollection('photo_360p_scans')
+                    ->findOneAndUpdate(
+                        ['photo_id' => $id],
+                        [
+                            '$set' => array_merge($docData, ['updated_at' => $now]),
+                            '$push' => [
+                                'verification_history' => [
+                                    'verified' => (bool) ($updated['verified_by_admin'] ?? false),
+                                    'status' => (string) ($updated['status'] ?? ''),
+                                    'admin_note' => (string) ($updated['admin_note'] ?? ''),
+                                    'rooms_count' => count($updated['detected_rooms'] ?? []),
+                                    'updated_at' => $now,
+                                ],
+                            ],
+                            '$setOnInsert' => ['created_at' => $now],
+                        ],
+                        [
+                            'upsert' => true,
+                            'returnDocument' => FindOneAndUpdate::RETURN_DOCUMENT_AFTER,
+                        ]
+                    );
+            } catch (\Throwable $e) {
+                Log::warning('Photo360pScanRepository MongoDB updateItem fallback: ' . $e->getMessage());
+            }
+        }
+
+        return $updated;
+    }
+
+    /**
+     * @param array<string, mixed> $normalized
+     */
+    protected function writePayloadToDisk(array $normalized): void
+    {
+        $dir = $this->storageDir();
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+
+        $lockPath = $this->path('.lock');
+        $lockHandle = fopen($lockPath, 'c+');
+        if ($lockHandle === false) {
+            throw new RuntimeException("Unable to open lock file at {$lockPath}");
+        }
+
+        try {
+            if (!flock($lockHandle, LOCK_EX)) {
+                throw new RuntimeException("Unable to acquire flock on {$lockPath}");
+            }
+
+            $json = json_encode($normalized, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if ($json === false) {
+                throw new RuntimeException('Failed to encode scan_results.json');
+            }
+
+            $targetPath = $this->path('scan_results.json');
+            $tmpPath = $this->path('scan_results.json.tmp.' . uniqid('', true));
+
+            if (file_put_contents($tmpPath, $json) === false) {
+                throw new RuntimeException("Failed to write temp scan file {$tmpPath}");
+            }
+
+            if (!@rename($tmpPath, $targetPath)) {
+                if (@copy($tmpPath, $targetPath)) {
+                    @unlink($tmpPath);
+                } else {
+                    @unlink($tmpPath);
+                    throw new RuntimeException("Failed to move {$tmpPath} to {$targetPath}");
+                }
+            }
+        } finally {
+            @flock($lockHandle, LOCK_UN);
+            @fclose($lockHandle);
+        }
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    protected function loadFromMongo(): ?array
+    {
+        try {
+            $docs = Photo360pScan::orderBy('photo_id')->get();
+            if ($docs->isEmpty()) {
+                return null;
+            }
+
+            $items = [];
+            $scanEngine = 'mongodb_odm';
+            $generatedAt = null;
+            foreach ($docs as $doc) {
+                $meta = is_array($doc->metadata ?? null) ? $doc->metadata : [];
+                if (!empty($meta['scan_engine'])) {
+                    $scanEngine = (string) $meta['scan_engine'];
+                }
+                if ($generatedAt === null && !empty($meta['generated_at'])) {
+                    $generatedAt = (string) $meta['generated_at'];
+                }
+                $items[] = $doc->toScanItem();
+            }
+
+            return $this->normalizePayload([
+                'generated_at' => $generatedAt ?? Carbon::now('Asia/Jakarta')->toIso8601String(),
+                'total_images' => count($items),
+                'scan_engine' => $scanEngine,
+                'items' => $items,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Photo360pScanRepository MongoDB load fallback: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $normalized
+     */
+    protected function persistAllToMongo(array $normalized): void
+    {
+        try {
+            $context = [
+                'scan_engine' => $normalized['scan_engine'] ?? 'unknown',
+                'generated_at' => $normalized['generated_at'] ?? null,
+            ];
+
+            foreach ($normalized['items'] ?? [] as $item) {
+                $photoId = (int) ($item['id'] ?? 0);
+                if ($photoId <= 0) {
+                    continue;
+                }
+                Photo360pScan::updateOrCreate(
+                    ['photo_id' => $photoId],
+                    Photo360pScan::fromScanItem($item, $context)
+                );
+            }
+        } catch (\Throwable $e) {
+            Log::warning('Photo360pScanRepository MongoDB persistAll skipped: ' . $e->getMessage());
+        }
     }
 
     /**

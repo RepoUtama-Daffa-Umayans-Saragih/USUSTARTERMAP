@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Contracts\WhatsAppGatewayInterface;
 use App\Models\FotocopyOrder;
+use App\Models\Mongo\WhatsappDispatchEvent;
 use App\Models\WhatsappDispatchLog;
 use App\Services\Invoice\OrderInvoiceService;
 use App\Services\WhatsApp\WhatsAppManager;
@@ -11,6 +12,7 @@ use App\Services\WhatsApp\WhatsAppPayloadFormatter;
 use App\Support\WhatsAppPhoneNormalizer;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 
@@ -20,11 +22,13 @@ class DispatchOrderToWhatsAppJob implements ShouldQueue
 
     public int $tries = 3;
     public array $backoff = [10, 30, 60];
+    protected string $currentOrderCode = '';
 
     public function __construct(
         public int $orderId,
         public bool $forceResend = false
     ) {
+        $this->onQueue('whatsapp');
     }
 
     public function handle(
@@ -38,6 +42,8 @@ class DispatchOrderToWhatsAppJob implements ShouldQueue
         if (!$order || !$order->isPaid()) {
             return;
         }
+
+        $this->currentOrderCode = (string) $order->order_code;
 
         if (empty($order->invoice_pdf_path) || !Storage::disk('local')->exists($order->invoice_pdf_path)) {
             $invoiceService->generateForOrder($order);
@@ -203,6 +209,8 @@ class DispatchOrderToWhatsAppJob implements ShouldQueue
         string $driverName,
         array $result
     ): void {
+        $status = ($result['success'] ?? false) ? 'sent' : 'failed';
+
         WhatsappDispatchLog::create([
             'fotocopy_order_id' => $orderId,
             'recipient_phone' => $phone,
@@ -212,10 +220,29 @@ class DispatchOrderToWhatsAppJob implements ShouldQueue
             'attachment_path' => $attachmentPath,
             'driver' => $driverName,
             'external_message_id' => $result['external_message_id'] ?? null,
-            'status' => ($result['success'] ?? false) ? 'sent' : 'failed',
+            'status' => $status,
             'attempts' => max(1, (int) $this->attempts()),
             'error_message' => $result['error'] ?? null,
             'sent_at' => ($result['success'] ?? false) ? now() : null,
         ]);
+
+        try {
+            WhatsappDispatchEvent::create([
+                'order_id' => $orderId,
+                'order_code' => $this->currentOrderCode,
+                'driver' => $driverName,
+                'recipient' => $phone,
+                'status' => $status,
+                'payload' => array_merge($payload, [
+                    'recipient_role' => $role,
+                    'message_type' => $type,
+                    'attachment_path' => $attachmentPath,
+                ]),
+                'raw_response' => $result,
+                'expires_at' => now()->addDays(WhatsappDispatchEvent::TTL_DAYS),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('DispatchOrderToWhatsAppJob MongoDB telemetry skipped: ' . $e->getMessage());
+        }
     }
 }

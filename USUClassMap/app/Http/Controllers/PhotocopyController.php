@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Jobs\DispatchOrderToWhatsAppJob;
+use App\Jobs\RefreshMsbdMaterializedViewsJob;
 use App\Models\FotocopyOrder;
 use App\Models\FotocopyOrderFile;
 use App\Models\FotocopyOrderItem;
@@ -11,6 +12,7 @@ use App\Models\FotocopyStore;
 use App\Models\PhotocopyPlace;
 use App\Models\PhotocopyItem;
 use App\Models\WhatsappDispatchLog;
+use App\Services\Cache\CampusRedisService;
 use App\Services\Fotocopy\OrderArchiveService;
 use App\Services\Fotocopy\OrderPaymentFulfillmentService;
 use App\Services\Invoice\OrderInvoiceService;
@@ -25,6 +27,7 @@ use App\Support\CatalogBehaviorClassifier;
 use App\Support\WhatsAppPhoneNormalizer;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
@@ -452,118 +455,147 @@ class PhotocopyController extends Controller
         $normalizedCustomerWa = WhatsAppPhoneNormalizer::normalize($rawWaInput);
         $rawPhoneStored = $validated['customer_phone'] ?? $rawWaInput;
 
-        $orderCode = 'ORD-' . date('Ymd') . '-' . strtoupper(Str::random(4));
+        $orderCode = DB::getDriverName() === 'pgsql'
+            ? (string) DB::selectOne('SELECT fn_generate_order_code() AS code')->code
+            : ('ORD-' . date('Ymd') . '-' . strtoupper(Str::random(4)));
         $pickupCode = $pdfInspector->generatePickupCode();
         $activeQueue = FotocopyOrder::where('store_id', $storeId)->where('order_status', 'Diproses')->count();
         $pickupEstimate = $pdfInspector->estimatePickupTime(max(1, $totalPagesToPrint), $activeQueue);
 
-        $order = DB::transaction(function () use (
-            $orderCode,
-            $pickupCode,
-            $pickupEstimate,
-            $storeId,
-            $validated,
-            $rawPhoneStored,
-            $normalizedCustomerWa,
-            $paymentMethod,
-            $totalPrice,
-            $preparedPdfs,
-            $preparedItems,
-            $pdfInspector
-        ): FotocopyOrder {
-            $order = FotocopyOrder::create([
-                'order_code' => $orderCode,
-                'pickup_code' => $pickupCode,
-                'store_id' => $storeId,
-                'user_id' => auth()->id(),
-                'customer_name' => $validated['customer_name'],
-                'customer_phone' => $rawPhoneStored,
-                'customer_whatsapp' => $normalizedCustomerWa,
-                'notes' => $validated['notes'] ?? null,
-                'payment_method' => $paymentMethod,
-                'payment_channel' => $validated['payment_channel'] ?? null,
-                'payment_status' => 'pending',
-                'order_status' => 'Menunggu',
-                'pickup_estimate' => $pickupEstimate,
-                'wa_dispatch_status' => 'not_ready',
-                'total_price' => $totalPrice,
-            ]);
+        try {
+            $order = DB::transaction(function () use (
+                $orderCode,
+                $pickupCode,
+                $pickupEstimate,
+                $storeId,
+                $place,
+                $validated,
+                $rawPhoneStored,
+                $normalizedCustomerWa,
+                $paymentMethod,
+                $totalPrice,
+                $preparedPdfs,
+                $preparedItems,
+                $pdfInspector
+            ): FotocopyOrder {
+                $order = FotocopyOrder::create([
+                    'order_code' => $orderCode,
+                    'pickup_code' => $pickupCode,
+                    'store_id' => $storeId,
+                    'user_id' => auth()->id(),
+                    'customer_name' => $validated['customer_name'],
+                    'customer_phone' => $rawPhoneStored,
+                    'customer_whatsapp' => $normalizedCustomerWa,
+                    'notes' => $validated['notes'] ?? null,
+                    'payment_method' => $paymentMethod,
+                    'payment_channel' => $validated['payment_channel'] ?? null,
+                    'payment_status' => 'pending',
+                    'order_status' => 'Menunggu',
+                    'pickup_estimate' => $pickupEstimate,
+                    'wa_dispatch_status' => 'not_ready',
+                    'total_price' => $totalPrice,
+                ]);
 
-            $firstPdfRecord = null;
-            foreach ($preparedPdfs as $pdfEntry) {
-                $meta = $pdfEntry['meta'];
-                $storedPath = $pdfInspector->storePrivateFile(
-                    $pdfEntry['uploaded_file'],
-                    $order->order_code,
-                    $pdfEntry['sort_order'],
-                    'pdf'
-                );
-
-                $bd = $pdfEntry['breakdown'];
-                if (!empty($pdfEntry['finishing_option']) && ($bd['finishing_qty'] ?? 0) > 0) {
-                    $itemDisplayName = sprintf(
-                        'Bundel Cetak PDF + %s: %s (%dx Print Rp %s + %dx %s Rp %s)',
-                        $pdfEntry['finishing_option'],
-                        $meta['original_name'],
-                        $bd['print_qty'],
-                        number_format($bd['print_subtotal'], 0, ',', '.'),
-                        $bd['finishing_qty'],
-                        $pdfEntry['finishing_option'],
-                        number_format($bd['finishing_subtotal'], 0, ',', '.')
+                $firstPdfRecord = null;
+                foreach ($preparedPdfs as $pdfEntry) {
+                    $meta = $pdfEntry['meta'];
+                    $storedPath = $pdfInspector->storePrivateFile(
+                        $pdfEntry['uploaded_file'],
+                        $order->order_code,
+                        $pdfEntry['sort_order'],
+                        'pdf'
                     );
-                } else {
-                    $itemDisplayName = "Cetak PDF: {$meta['original_name']} ({$pdfEntry['print_mode']}, {$meta['page_count']} hal)";
+
+                    $bd = $pdfEntry['breakdown'];
+                    if (!empty($pdfEntry['finishing_option']) && ($bd['finishing_qty'] ?? 0) > 0) {
+                        $itemDisplayName = sprintf(
+                            'Bundel Cetak PDF + %s: %s (%dx Print Rp %s + %dx %s Rp %s)',
+                            $pdfEntry['finishing_option'],
+                            $meta['original_name'],
+                            $bd['print_qty'],
+                            number_format($bd['print_subtotal'], 0, ',', '.'),
+                            $bd['finishing_qty'],
+                            $pdfEntry['finishing_option'],
+                            number_format($bd['finishing_subtotal'], 0, ',', '.')
+                        );
+                    } else {
+                        $itemDisplayName = "Cetak PDF: {$meta['original_name']} ({$pdfEntry['print_mode']}, {$meta['page_count']} hal)";
+                    }
+
+                    $orderItem = FotocopyOrderItem::create([
+                        'order_id' => $order->id,
+                        'service_id' => $pdfEntry['matched_service_id'],
+                        'service_name' => $itemDisplayName,
+                        'category' => !empty($pdfEntry['finishing_option']) ? 'Bundel Print PDF + Finishing' : 'Print PDF',
+                        'price' => (int) round($pdfEntry['subtotal'] / max(1, $pdfEntry['copies'])),
+                        'quantity' => $pdfEntry['copies'],
+                        'subtotal' => $pdfEntry['subtotal'],
+                    ]);
+
+                    $fileRecord = FotocopyOrderFile::create([
+                        'fotocopy_order_id' => $order->id,
+                        'fotocopy_order_item_id' => $orderItem->id,
+                        'original_name' => $meta['original_name'],
+                        'stored_path' => $storedPath,
+                        'storage_disk' => 'local',
+                        'mime_type' => $meta['mime_type'],
+                        'file_size' => $meta['file_size'],
+                        'page_count' => $meta['page_count'],
+                        'copies' => $pdfEntry['copies'],
+                        'print_mode' => $pdfEntry['print_mode'],
+                        'paper_size' => $pdfEntry['paper_size'],
+                        'finishing_option' => $pdfEntry['finishing_option'],
+                        'note' => $pdfEntry['note'],
+                        'subtotal_estimated' => $pdfEntry['subtotal'],
+                        'sort_order' => $pdfEntry['sort_order'],
+                        'is_encrypted' => $meta['is_encrypted'],
+                    ]);
+
+                    if ($firstPdfRecord === null) {
+                        $firstPdfRecord = $fileRecord;
+                    }
                 }
 
-                $orderItem = FotocopyOrderItem::create([
-                    'order_id' => $order->id,
-                    'service_id' => $pdfEntry['matched_service_id'],
-                    'service_name' => $itemDisplayName,
-                    'category' => !empty($pdfEntry['finishing_option']) ? 'Bundel Print PDF + Finishing' : 'Print PDF',
-                    'price' => (int) round($pdfEntry['subtotal'] / max(1, $pdfEntry['copies'])),
-                    'quantity' => $pdfEntry['copies'],
-                    'subtotal' => $pdfEntry['subtotal'],
-                ]);
-
-                $fileRecord = FotocopyOrderFile::create([
-                    'fotocopy_order_id' => $order->id,
-                    'fotocopy_order_item_id' => $orderItem->id,
-                    'original_name' => $meta['original_name'],
-                    'stored_path' => $storedPath,
-                    'storage_disk' => 'local',
-                    'mime_type' => $meta['mime_type'],
-                    'file_size' => $meta['file_size'],
-                    'page_count' => $meta['page_count'],
-                    'copies' => $pdfEntry['copies'],
-                    'print_mode' => $pdfEntry['print_mode'],
-                    'paper_size' => $pdfEntry['paper_size'],
-                    'finishing_option' => $pdfEntry['finishing_option'],
-                    'note' => $pdfEntry['note'],
-                    'subtotal_estimated' => $pdfEntry['subtotal'],
-                    'sort_order' => $pdfEntry['sort_order'],
-                    'is_encrypted' => $meta['is_encrypted'],
-                ]);
-
-                if ($firstPdfRecord === null) {
-                    $firstPdfRecord = $fileRecord;
+                if ($firstPdfRecord) {
+                    $order->update([
+                        'file_path' => $firstPdfRecord->stored_path,
+                        'file_name' => $firstPdfRecord->original_name,
+                        'file_size' => $firstPdfRecord->formatted_size,
+                        'file_type' => 'pdf',
+                    ]);
                 }
-            }
 
-            if ($firstPdfRecord) {
-                $order->update([
-                    'file_path' => $firstPdfRecord->stored_path,
-                    'file_name' => $firstPdfRecord->original_name,
-                    'file_size' => $firstPdfRecord->formatted_size,
-                    'file_type' => 'pdf',
-                ]);
-            }
+                foreach ($preparedItems as $itemData) {
+                    if (!empty($itemData['service_id'])) {
+                        $svcLock = FotocopyService::where('id', $itemData['service_id'])->lockForUpdate()->first();
+                        if ($svcLock && $svcLock->stock !== null) {
+                            if ($svcLock->stock < $itemData['quantity']) {
+                                throw new InvalidArgumentException("Stok {$svcLock->name} tidak mencukupi (tersedia {$svcLock->stock}).");
+                            }
+                            $svcLock->decrement('stock', $itemData['quantity']);
+                            PhotocopyItem::where('photocopy_place_id', $place->id)
+                                ->where('name', $svcLock->name)
+                                ->whereNotNull('stock')
+                                ->decrement('stock', $itemData['quantity']);
+                        }
+                    }
 
-            foreach ($preparedItems as $itemData) {
-                FotocopyOrderItem::create(array_merge(['order_id' => $order->id], $itemData));
-            }
+                    FotocopyOrderItem::create(array_merge(['order_id' => $order->id], $itemData));
+                }
 
-            return $order;
-        });
+                return $order;
+            });
+        } catch (InvalidArgumentException $e) {
+            return $this->orderValidationError($request, $e->getMessage());
+        }
+
+        if (DB::getDriverName() === 'pgsql') {
+            try {
+                RefreshMsbdMaterializedViewsJob::dispatch('revenue');
+            } catch (\Throwable $e) {
+                Log::debug('PhotocopyController storeOrder MV refresh skipped: ' . $e->getMessage());
+            }
+        }
 
         // Execute payment strategy (Order stays 'pending' -> DO NOT dispatch WhatsApp yet)
         $paymentManager = app(PaymentManager::class);
@@ -727,15 +759,23 @@ class PhotocopyController extends Controller
      */
     public function simulatePayment(Request $request, $orderCode)
     {
-        $order = FotocopyOrder::where('order_code', $orderCode)->firstOrFail();
-        $paymentManager = app(PaymentManager::class);
-        $success = $paymentManager->simulateSuccess($order);
-        $order->refresh();
+        [$order, $success] = app(CampusRedisService::class)->withOrderPaymentLock(
+            (string) $orderCode,
+            function () use ($orderCode): array {
+                $order = FotocopyOrder::where('order_code', $orderCode)->firstOrFail();
+                $wasPaidBefore = $order->isPaid();
+                $paymentManager = app(PaymentManager::class);
+                $success = $paymentManager->simulateSuccess($order);
+                $order->refresh();
 
-        if ($success && $order->isPaid()) {
-            app(OrderPaymentFulfillmentService::class)->handlePaidOrder($order, true);
-            $order->refresh();
-        }
+                if ($success && $order->isPaid() && empty($order->invoice_pdf_path)) {
+                    app(OrderPaymentFulfillmentService::class)->handlePaidOrder($order, !$wasPaidBefore);
+                    $order->refresh();
+                }
+
+                return [$order, $success];
+            }
+        );
 
         $order->load(['store', 'items', 'files']);
         $waStatus = app(WhatsAppManager::class)->statusSummary();

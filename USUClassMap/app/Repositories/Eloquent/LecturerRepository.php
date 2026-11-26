@@ -18,9 +18,9 @@ class LecturerRepository extends BaseRepository implements LecturerRepositoryInt
 
         if ($keyword) {
             $query->where(function ($q) use ($keyword) {
-                $q->where('name', 'like', "%{$keyword}%")
-                  ->orWhere('nip', 'like', "%{$keyword}%")
-                  ->orWhere('email', 'like', "%{$keyword}%");
+                $q->whereSearchLike('name', "%{$keyword}%")
+                  ->orWhereSearchLike('nip', "%{$keyword}%")
+                  ->orWhereSearchLike('email', "%{$keyword}%");
             });
         }
 

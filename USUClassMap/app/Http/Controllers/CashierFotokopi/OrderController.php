@@ -4,18 +4,23 @@ namespace App\Http\Controllers\CashierFotokopi;
 
 use App\Http\Controllers\Controller;
 use App\Jobs\DispatchOrderToWhatsAppJob;
+use App\Jobs\RefreshMsbdMaterializedViewsJob;
 use App\Jobs\SendCustomerReadyNotificationJob;
 use App\Models\FotocopyOrder;
 use App\Models\FotocopyOrderFile;
 use App\Models\FotocopyOrderItem;
 use App\Models\FotocopyService;
 use App\Models\FotocopyStore;
+use App\Models\PhotocopyItem;
+use App\Models\PhotocopyPlace;
 use App\Services\Fotocopy\OrderArchiveService;
 use App\Services\Fotocopy\OrderPaymentFulfillmentService;
 use App\Services\Invoice\OrderInvoiceService;
 use App\Services\Pdf\PdfMetadataInspectorService;
 use App\Support\WhatsAppPhoneNormalizer;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -46,10 +51,10 @@ class OrderController extends Controller
         if ($request->filled('q')) {
             $q = $request->input('q');
             $query->where(function ($sq) use ($q) {
-                $sq->where('order_code', 'like', "%{$q}%")
-                    ->orWhere('customer_name', 'like', "%{$q}%")
-                    ->orWhere('customer_phone', 'like', "%{$q}%")
-                    ->orWhere('notes', 'like', "%{$q}%");
+                $sq->whereSearchLike('order_code', "%{$q}%")
+                    ->orWhereSearchLike('customer_name', "%{$q}%")
+                    ->orWhereSearchLike('customer_phone', "%{$q}%")
+                    ->orWhereSearchLike('notes', "%{$q}%");
             });
         }
 
@@ -110,6 +115,12 @@ class OrderController extends Controller
 
         if (!$wasPaid && $order->isPaid()) {
             app(OrderPaymentFulfillmentService::class)->handlePaidOrder($order, true);
+        } elseif (DB::getDriverName() === 'pgsql') {
+            try {
+                RefreshMsbdMaterializedViewsJob::dispatch('revenue');
+            } catch (\Throwable $e) {
+                Log::debug('Cashier OrderController MV refresh skipped: ' . $e->getMessage());
+            }
         }
 
         if ($oldStatus !== 'Selesai' && $order->order_status === 'Selesai' && class_exists(SendCustomerReadyNotificationJob::class)) {
@@ -171,7 +182,9 @@ class OrderController extends Controller
             'items.*.quantity' => 'required|integer|min:1',
         ]);
 
-        $orderCode = 'POS-' . date('Ymd') . '-' . strtoupper(Str::random(4));
+        $orderCode = DB::getDriverName() === 'pgsql'
+            ? (string) DB::selectOne('SELECT fn_generate_order_code() AS code')->code
+            : ('POS-' . date('Ymd') . '-' . strtoupper(Str::random(4)));
         $uploadedList = [];
 
         $multiFiles = $request->file('pos_files', []);
@@ -197,103 +210,149 @@ class OrderController extends Controller
             ];
         }
 
-        $totalPrice = 0;
-        $orderItemsData = [];
-
-        foreach ($validated['items'] as $item) {
-            $service = FotocopyService::find($item['service_id']);
-            if ($service) {
-                $subtotal = $service->price * $item['quantity'];
-                $totalPrice += $subtotal;
-                $orderItemsData[] = [
-                    'service_id' => $service->id,
-                    'service_name' => $service->name,
-                    'category' => $service->category,
-                    'price' => $service->price,
-                    'quantity' => $item['quantity'],
-                    'subtotal' => $subtotal,
-                ];
-            }
-        }
-
         $normalizedWa = WhatsAppPhoneNormalizer::normalize($validated['customer_phone'] ?? null);
         $pickupCode = $pdfInspector->generatePickupCode();
         $pickupEstimate = $pdfInspector->estimatePickupTime(max(1, array_sum(array_column($uploadedList, 'pages'))));
+        $pairedPlace = PhotocopyPlace::where('slug', $myStore->slug)->first()
+            ?? PhotocopyPlace::where('name', $myStore->name)->first();
 
-        $order = FotocopyOrder::create([
-            'order_code' => $orderCode,
-            'pickup_code' => $pickupCode,
-            'store_id' => $myStore->id,
-            'user_id' => $user->id,
-            'customer_name' => $validated['customer_name'],
-            'customer_phone' => $validated['customer_phone'] ?? null,
-            'customer_whatsapp' => $normalizedWa,
-            'notes' => $validated['notes'] ?? null,
-            'payment_method' => $validated['payment_method'],
-            'payment_status' => 'paid',
-            'paid_at' => now(),
-            'order_status' => $validated['order_status'],
-            'pickup_estimate' => $pickupEstimate,
-            'wa_dispatch_status' => 'not_ready',
-            'total_price' => $totalPrice,
-        ]);
+        try {
+            $order = DB::transaction(function () use (
+                $validated,
+                $user,
+                $myStore,
+                $pairedPlace,
+                $orderCode,
+                $pickupCode,
+                $normalizedWa,
+                $pickupEstimate,
+                $uploadedList,
+                $pdfInspector
+            ): FotocopyOrder {
+                $totalPrice = 0;
+                $orderItemsData = [];
 
-        foreach ($orderItemsData as $itemData) {
-            $order->items()->create($itemData);
-        }
+                foreach ($validated['items'] as $item) {
+                    $service = FotocopyService::where('id', $item['service_id'])
+                        ->lockForUpdate()
+                        ->first();
 
-        $firstFileMeta = null;
-        foreach ($uploadedList as $idx => $entry) {
-            /** @var \Illuminate\Http\UploadedFile $uploaded */
-            $uploaded = $entry['file'];
-            $origName = $uploaded->getClientOriginalName();
-            $ext = strtolower($uploaded->getClientOriginalExtension() ?: 'pdf');
-            $bytes = (int) $uploaded->getSize();
-            $storedPath = $pdfInspector->storePrivateFile($uploaded, $order->order_code, $idx + 1, $ext);
+                    if ($service) {
+                        $qty = (int) $item['quantity'];
+                        if ($service->stock !== null) {
+                            if ($service->stock < $qty) {
+                                throw new \InvalidArgumentException("Stok {$service->name} tidak mencukupi (tersedia {$service->stock}).");
+                            }
+                            $service->decrement('stock', $qty);
+                            if ($pairedPlace) {
+                                PhotocopyItem::where('photocopy_place_id', $pairedPlace->id)
+                                    ->where('name', $service->name)
+                                    ->whereNotNull('stock')
+                                    ->decrement('stock', $qty);
+                            }
+                        }
 
-            $pageCount = max(1, (int) $entry['pages']);
-            if ($ext === 'pdf' && $pdfInspector->hasValidPdfMagicBytes($uploaded)) {
-                $raw = @file_get_contents($uploaded->getRealPath());
-                if ($raw !== false) {
-                    $detected = $pdfInspector->estimatePdfPageCountFromContent($raw);
-                    if ($detected && $detected > 0) {
-                        $pageCount = $detected;
+                        $subtotal = $service->price * $qty;
+                        $totalPrice += $subtotal;
+                        $orderItemsData[] = [
+                            'service_id' => $service->id,
+                            'service_name' => $service->name,
+                            'category' => $service->category,
+                            'price' => $service->price,
+                            'quantity' => $qty,
+                            'subtotal' => $subtotal,
+                        ];
                     }
                 }
-            }
 
-            $fileRecord = FotocopyOrderFile::create([
-                'fotocopy_order_id' => $order->id,
-                'original_name' => $origName,
-                'stored_path' => $storedPath,
-                'storage_disk' => 'local',
-                'mime_type' => $uploaded->getMimeType() ?: ($ext === 'pdf' ? 'application/pdf' : 'application/octet-stream'),
-                'file_size' => $bytes,
-                'page_count' => $pageCount,
-                'copies' => max(1, (int) $entry['copies']),
-                'print_mode' => $orderItemsData[0]['service_name'] ?? 'Walk-in POS',
-                'paper_size' => 'A4',
-                'note' => !empty($entry['note']) ? trim((string) $entry['note']) : null,
-                'subtotal_estimated' => 0,
-                'sort_order' => $idx + 1,
-                'is_encrypted' => false,
-            ]);
+                $order = FotocopyOrder::create([
+                    'order_code' => $orderCode,
+                    'pickup_code' => $pickupCode,
+                    'store_id' => $myStore->id,
+                    'user_id' => $user->id,
+                    'customer_name' => $validated['customer_name'],
+                    'customer_phone' => $validated['customer_phone'] ?? null,
+                    'customer_whatsapp' => $normalizedWa,
+                    'notes' => $validated['notes'] ?? null,
+                    'payment_method' => $validated['payment_method'],
+                    'payment_status' => 'paid',
+                    'paid_at' => now(),
+                    'order_status' => $validated['order_status'],
+                    'pickup_estimate' => $pickupEstimate,
+                    'wa_dispatch_status' => 'not_ready',
+                    'total_price' => $totalPrice,
+                ]);
 
-            if ($firstFileMeta === null) {
-                $firstFileMeta = [
-                    'file_path' => $storedPath,
-                    'file_name' => $origName,
-                    'file_size' => PdfMetadataInspectorService::formatBytes($bytes),
-                    'file_type' => $ext,
-                ];
-            }
-        }
+                foreach ($orderItemsData as $itemData) {
+                    $order->items()->create($itemData);
+                }
 
-        if ($firstFileMeta !== null) {
-            $order->update($firstFileMeta);
+                $firstFileMeta = null;
+                foreach ($uploadedList as $idx => $entry) {
+                    /** @var \Illuminate\Http\UploadedFile $uploaded */
+                    $uploaded = $entry['file'];
+                    $origName = $uploaded->getClientOriginalName();
+                    $ext = strtolower($uploaded->getClientOriginalExtension() ?: 'pdf');
+                    $bytes = (int) $uploaded->getSize();
+                    $storedPath = $pdfInspector->storePrivateFile($uploaded, $order->order_code, $idx + 1, $ext);
+
+                    $pageCount = max(1, (int) $entry['pages']);
+                    if ($ext === 'pdf' && $pdfInspector->hasValidPdfMagicBytes($uploaded)) {
+                        $raw = @file_get_contents($uploaded->getRealPath());
+                        if ($raw !== false) {
+                            $detected = $pdfInspector->estimatePdfPageCountFromContent($raw);
+                            if ($detected && $detected > 0) {
+                                $pageCount = $detected;
+                            }
+                        }
+                    }
+
+                    FotocopyOrderFile::create([
+                        'fotocopy_order_id' => $order->id,
+                        'original_name' => $origName,
+                        'stored_path' => $storedPath,
+                        'storage_disk' => 'local',
+                        'mime_type' => $uploaded->getMimeType() ?: ($ext === 'pdf' ? 'application/pdf' : 'application/octet-stream'),
+                        'file_size' => $bytes,
+                        'page_count' => $pageCount,
+                        'copies' => max(1, (int) $entry['copies']),
+                        'print_mode' => $orderItemsData[0]['service_name'] ?? 'Walk-in POS',
+                        'paper_size' => 'A4',
+                        'note' => !empty($entry['note']) ? trim((string) $entry['note']) : null,
+                        'subtotal_estimated' => 0,
+                        'sort_order' => $idx + 1,
+                        'is_encrypted' => false,
+                    ]);
+
+                    if ($firstFileMeta === null) {
+                        $firstFileMeta = [
+                            'file_path' => $storedPath,
+                            'file_name' => $origName,
+                            'file_size' => PdfMetadataInspectorService::formatBytes($bytes),
+                            'file_type' => $ext,
+                        ];
+                    }
+                }
+
+                if ($firstFileMeta !== null) {
+                    $order->update($firstFileMeta);
+                }
+
+                return $order;
+            });
+        } catch (\InvalidArgumentException $e) {
+            return redirect()->back()->withInput()->with('error', $e->getMessage());
         }
 
         app(OrderPaymentFulfillmentService::class)->handlePaidOrder($order->fresh(), false);
+
+        if (DB::getDriverName() === 'pgsql') {
+            try {
+                RefreshMsbdMaterializedViewsJob::dispatch('revenue');
+            } catch (\Throwable $e) {
+                Log::debug('Cashier storePos MV refresh skipped: ' . $e->getMessage());
+            }
+        }
 
         return redirect()->route('cashier-fotokopi.orders.index')
             ->with('success', "Pesanan kasir #{$order->order_code} berhasil dibuat dan tercatat!");

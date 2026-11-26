@@ -2,12 +2,16 @@
 
 namespace App\Services\Fotocopy;
 
+use App\Jobs\RefreshMsbdMaterializedViewsJob;
 use App\Models\FotocopyService;
 use App\Models\FotocopyStore;
 use App\Models\PhotocopyItem;
 use App\Models\PhotocopyPlace;
 use App\Models\Service;
+use App\Services\Cache\CampusRedisService;
 use App\Support\WhatsAppPhoneNormalizer;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class StoreMapSyncService
@@ -118,6 +122,8 @@ class StoreMapSyncService
             $this->syncServicesBetweenStoreAndPlace($store, $place);
         }
 
+        $this->refreshPhotocopyCachesAndViews(true);
+
         return $place;
     }
 
@@ -174,6 +180,8 @@ class StoreMapSyncService
         if ($syncItems) {
             $this->syncServicesBetweenStoreAndPlace($store, $place);
         }
+
+        $this->refreshPhotocopyCachesAndViews(true);
 
         return $store;
     }
@@ -248,6 +256,8 @@ class StoreMapSyncService
             $store->forceFill(['starting_price' => (int) $minAvailable])->saveQuietly();
         }
 
+        $this->refreshPhotocopyCachesAndViews(false);
+
         return [
             'items_synced' => $itemsSynced,
             'services_created' => $servicesCreated,
@@ -318,6 +328,8 @@ class StoreMapSyncService
             $store->forceFill(['starting_price' => (int) $minAvailable])->saveQuietly();
         }
 
+        $this->refreshPhotocopyCachesAndViews(false);
+
         return $item;
     }
 
@@ -327,7 +339,11 @@ class StoreMapSyncService
         if (!$place) {
             return false;
         }
-        return (bool) $place->delete();
+        $deleted = (bool) $place->delete();
+        if ($deleted) {
+            $this->refreshPhotocopyCachesAndViews(true);
+        }
+        return $deleted;
     }
 
     public function deleteItemForService(FotocopyService $service): bool
@@ -337,9 +353,13 @@ class StoreMapSyncService
         if (!$place) {
             return false;
         }
-        return PhotocopyItem::where('photocopy_place_id', $place->id)
+        $deleted = PhotocopyItem::where('photocopy_place_id', $place->id)
             ->where('name', $service->name)
             ->delete() > 0;
+        if ($deleted) {
+            $this->refreshPhotocopyCachesAndViews(false);
+        }
+        return $deleted;
     }
 
     /**
@@ -384,6 +404,8 @@ class StoreMapSyncService
             $servicesCreated += $svcRes['services_created'];
         }
 
+        $this->refreshPhotocopyCachesAndViews(true);
+
         return [
             'stores_count' => FotocopyStore::count(),
             'places_count' => PhotocopyPlace::count(),
@@ -395,6 +417,24 @@ class StoreMapSyncService
             'items_synced' => $itemsSynced,
             'services_created' => $servicesCreated,
         ];
+    }
+
+    protected function refreshPhotocopyCachesAndViews(bool $syncGeo = false): void
+    {
+        $redis = app(CampusRedisService::class);
+        $redis->invalidatePhotocopyCaches();
+
+        if ($syncGeo) {
+            $redis->syncPlacesGeo();
+        }
+
+        if (DB::getDriverName() === 'pgsql') {
+            try {
+                RefreshMsbdMaterializedViewsJob::dispatch('catalog');
+            } catch (\Throwable $e) {
+                Log::debug('StoreMapSyncService MV refresh skipped: ' . $e->getMessage());
+            }
+        }
     }
 
     public function resolvePlaceForStore(

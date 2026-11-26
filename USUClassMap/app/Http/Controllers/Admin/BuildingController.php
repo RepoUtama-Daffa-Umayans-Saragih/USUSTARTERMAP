@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Admin\BuildingRequest;
 use App\Jobs\RegenerateRdfJob;
 use App\Models\Building;
+use App\Services\Cache\CampusRedisService;
 use Illuminate\Http\Request;
 
 class BuildingController extends Controller
@@ -17,8 +18,8 @@ class BuildingController extends Controller
         if ($request->filled('q')) {
             $search = $request->q;
             $query->where(function ($q) use ($search) {
-                $q->where('name', 'like', "%{$search}%")
-                  ->orWhere('code', 'like', "%{$search}%");
+                $q->whereSearchLike('name', "%{$search}%")
+                  ->orWhereSearchLike('code', "%{$search}%");
             });
         }
 
@@ -35,6 +36,8 @@ class BuildingController extends Controller
     public function store(BuildingRequest $request)
     {
         Building::create($request->validated());
+        app(CampusRedisService::class)->invalidateBuildingCaches();
+        app(CampusRedisService::class)->syncBuildingsGeo();
         RegenerateRdfJob::dispatch();
 
         return redirect()->route('admin.buildings.index')
@@ -49,6 +52,8 @@ class BuildingController extends Controller
     public function update(BuildingRequest $request, Building $building)
     {
         $building->update($request->validated());
+        app(CampusRedisService::class)->invalidateBuildingCaches();
+        app(CampusRedisService::class)->syncBuildingsGeo();
         RegenerateRdfJob::dispatch();
 
         return redirect()->route('admin.buildings.index')
@@ -58,6 +63,8 @@ class BuildingController extends Controller
     public function destroy(Building $building)
     {
         $building->delete();
+        app(CampusRedisService::class)->invalidateBuildingCaches();
+        app(CampusRedisService::class)->syncBuildingsGeo();
         RegenerateRdfJob::dispatch();
 
         return redirect()->route('admin.buildings.index')

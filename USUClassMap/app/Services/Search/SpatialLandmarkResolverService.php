@@ -3,10 +3,15 @@
 namespace App\Services\Search;
 
 use App\Models\Building;
+use App\Models\Mongo\CampusRoutingGraph;
+use App\Models\Mongo\SearchAnalyticsLog;
 use App\Models\Schedule;
+use App\Services\Cache\CampusRedisService;
 use App\Services\OperationalStatusService;
 use Carbon\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Engine 3: SpatialLandmarkResolverService
@@ -39,6 +44,7 @@ class SpatialLandmarkResolverService
      */
     public function resolve(string $query, array $options = []): array
     {
+        $startedAt = microtime(true);
         $parsed = $options['parsed'] ?? $this->intentParser->parse($query, $options);
         $limit = max(3, min(10, (int) ($options['limit'] ?? 5)));
         $day = $options['day'] ?? $parsed['day'] ?? null;
@@ -60,14 +66,37 @@ class SpatialLandmarkResolverService
             ];
         }
 
-        // Load all 77 buildings with rooms & room media for rich card info
-        $buildings = Building::query()
-            ->with(['rooms.media'])
-            ->orderBy('id')
-            ->get();
+        // Collect exact landmark IDs to exclude from candidate predictions
+        $excludedIds = $this->collectExcludedBuildingIds($constraints);
+
+        // Precompute landmark coordinates so PostgreSQL/Redis GEO can narrow large candidate sets
+        $landmarkCoords = [];
+        foreach ($constraints as $c) {
+            foreach (['buildings', 'buildings_a', 'buildings_b'] as $bk) {
+                if (!empty($c[$bk][0]['latitude']) && !empty($c[$bk][0]['longitude'])) {
+                    $landmarkCoords[] = [
+                        'lat' => (float) $c[$bk][0]['latitude'],
+                        'lng' => (float) $c[$bk][0]['longitude'],
+                    ];
+                }
+            }
+        }
+
+        $prefilterIds = $this->prefilterNearbyBuildingIds($landmarkCoords, $excludedIds);
+
+        // Load buildings with rooms & room media (pre-filtered when L1/L2 GEO hits >= 5 candidates)
+        $buildingsQuery = Building::query()->with(['rooms.media'])->orderBy('id');
+        if (!empty($prefilterIds)) {
+            $buildingsQuery->whereIn('id', $prefilterIds);
+        }
+        $buildings = $buildingsQuery->get();
+
+        if ($buildings->isEmpty() && !empty($prefilterIds)) {
+            $buildings = Building::query()->with(['rooms.media'])->orderBy('id')->get();
+        }
 
         if ($buildings->isEmpty()) {
-            return [
+            $emptyResult = [
                 'status'           => 'success',
                 'query'            => $query,
                 'constraints'      => [],
@@ -76,6 +105,8 @@ class SpatialLandmarkResolverService
                 'count'            => 0,
                 'candidates'       => [],
             ];
+            $this->recordAnalyticsLog($query, 0, $startedAt, ['reason' => 'empty_buildings']);
+            return $emptyResult;
         }
 
         // Compute facing bearing for each building
@@ -85,15 +116,12 @@ class SpatialLandmarkResolverService
             $buildingBearings[$b->id] = $this->estimateFacingBearing($b, $roadNodes);
         }
 
-        // Collect exact landmark IDs to exclude from candidate predictions
-        $excludedIds = $this->collectExcludedBuildingIds($constraints);
-
         // Optional academic schedules matching course terms or day
         $schedulesByBuilding = $this->loadMatchingSchedulesByBuilding($courseTerms, $day);
 
         // If there are still no constraints (pure unknown query), return gracefully
         if (empty($constraints)) {
-            return [
+            $noConstraintResult = [
                 'status'          => 'success',
                 'query'           => $query,
                 'constraints'     => [],
@@ -102,6 +130,8 @@ class SpatialLandmarkResolverService
                 'count'           => 0,
                 'candidates'      => [],
             ];
+            $this->recordAnalyticsLog($query, 0, $startedAt, ['reason' => 'no_constraints']);
+            return $noConstraintResult;
         }
 
         // Precompute anchor summary info & inter-landmark distances for corridor bonus
@@ -284,7 +314,7 @@ class SpatialLandmarkResolverService
             $advisory = implode(' ', $ambiguityNotes);
         }
 
-        return [
+        $result = [
             'status'          => 'success',
             'query'           => $query,
             'constraints'     => array_map(fn (array $c): array => [
@@ -298,6 +328,12 @@ class SpatialLandmarkResolverService
             'count'           => count($candidates),
             'candidates'      => $candidates,
         ];
+
+        $this->recordAnalyticsLog($query, count($candidates), $startedAt, [
+            'prefiltered' => !empty($prefilterIds),
+        ]);
+
+        return $result;
     }
 
     /**
@@ -457,6 +493,27 @@ class SpatialLandmarkResolverService
             return self::$graphNodes;
         }
 
+        try {
+            $doc = CampusRoutingGraph::where('is_active', true)
+                ->orderByDesc('generated_at')
+                ->first(['nodes']);
+
+            if ($doc && !empty($doc->nodes)) {
+                $nodes = [];
+                foreach ($doc->nodes as $n) {
+                    if (is_array($n) && isset($n['lat'], $n['lng'])) {
+                        $nodes[] = ['lat' => (float) $n['lat'], 'lng' => (float) $n['lng']];
+                    }
+                }
+                if (!empty($nodes)) {
+                    self::$graphNodes = $nodes;
+                    return $nodes;
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::warning('SpatialLandmarkResolver: MongoDB graph nodes fallback to JSON: ' . $e->getMessage());
+        }
+
         $path = storage_path('app/routing/usu_campus_graph.json');
         if (!file_exists($path)) {
             self::$graphNodes = [];
@@ -477,6 +534,72 @@ class SpatialLandmarkResolverService
         self::$graphNodes = $nodes;
 
         return $nodes;
+    }
+
+    /**
+     * Pre-filter candidate building IDs using L1 Redis GEO and L2 PostGIS fn_find_nearby_buildings().
+     *
+     * @param  array<int, array{lat: float, lng: float}>  $landmarkCoords
+     * @param  array<int, int>  $excludedIds
+     * @return array<int, int>
+     */
+    protected function prefilterNearbyBuildingIds(array $landmarkCoords, array $excludedIds): array
+    {
+        if (DB::getDriverName() !== 'pgsql' || empty($landmarkCoords)) {
+            return [];
+        }
+
+        $candidateIds = [];
+        $redis = app(CampusRedisService::class);
+
+        foreach ($landmarkCoords as $coord) {
+            $ids = $redis->findNearbyBuildingIds($coord['lat'], $coord['lng'], 2500, 80);
+
+            if (empty($ids)) {
+                try {
+                    $rows = DB::select(
+                        'SELECT id FROM fn_find_nearby_buildings(?, ?, ?, ?)',
+                        [$coord['lat'], $coord['lng'], 2500, 80]
+                    );
+                    $ids = array_map(static fn ($r): int => (int) $r->id, $rows);
+                } catch (\Throwable) {
+                    $ids = [];
+                }
+            }
+
+            foreach ($ids as $id) {
+                $candidateIds[$id] = true;
+            }
+        }
+
+        $nonExcludedCount = count(array_diff(array_keys($candidateIds), $excludedIds));
+        if ($nonExcludedCount < 5) {
+            return [];
+        }
+
+        foreach ($excludedIds as $exId) {
+            $candidateIds[$exId] = true;
+        }
+
+        return array_keys($candidateIds);
+    }
+
+    protected function recordAnalyticsLog(string $query, int $resultCount, float $startedAt, array $meta = []): void
+    {
+        try {
+            SearchAnalyticsLog::create([
+                'endpoint' => '/api/smart-search:spatial',
+                'query' => $query,
+                'detected_mode' => 'spatial_building_finder',
+                'has_gps' => false,
+                'result_count' => $resultCount,
+                'latency_ms' => max(0, (int) round((microtime(true) - $startedAt) * 1000)),
+                'meta' => $meta,
+                'expires_at' => now()->addDays(SearchAnalyticsLog::TTL_DAYS),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('SpatialLandmarkResolver SearchAnalyticsLog skipped: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -541,8 +664,8 @@ class SpatialLandmarkResolverService
             $q->where(function ($sub) use ($courseTerms): void {
                 foreach ($courseTerms as $term) {
                     $like = "%{$term}%";
-                    $sub->orWhereHas('course', fn ($cq) => $cq->where('name', 'LIKE', $like)->orWhere('code', 'LIKE', $like))
-                        ->orWhereHas('lecturer', fn ($lq) => $lq->where('name', 'LIKE', $like));
+                    $sub->orWhereHas('course', fn ($cq) => $cq->whereSearchLike('name', $like)->orWhereSearchLike('code', $like))
+                        ->orWhereHas('lecturer', fn ($lq) => $lq->whereSearchLike('name', $like));
                 }
             });
         }

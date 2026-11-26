@@ -17,7 +17,7 @@ class RegenerateRdfJob implements ShouldQueue
      */
     public function __construct()
     {
-        //
+        $this->onQueue('rdf');
     }
 
     /**
@@ -25,6 +25,11 @@ class RegenerateRdfJob implements ShouldQueue
      */
     public function handle(RdfGeneratorService $rdfService): void
     {
+        if (!config('sparql.auto_sync', true)) {
+            Log::debug('RegenerateRdfJob: Skipped because sparql.auto_sync is disabled.');
+            return;
+        }
+
         Log::info('RegenerateRdfJob: Starting RDF synchronization triggered by database change.');
 
         $rdfService->generate();

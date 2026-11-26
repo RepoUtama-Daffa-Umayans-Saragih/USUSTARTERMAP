@@ -2,6 +2,10 @@
 
 namespace App\Services\VirtualWalk;
 
+use App\Models\Mongo\FibVirtualWalkGraph;
+use App\Services\Cache\CampusRedisService;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 /**
@@ -9,7 +13,7 @@ use Illuminate\Support\Facades\Storage;
  *
  * Mengelola graf navigasi Street View 360° Fakultas Ilmu Budaya (FIB) USU
  * berbasis foto #428-#495 (67 scene aktif, #434 dikecualikan) dengan persistensi
- * sinkron ke runtime storage dan Git snapshot.
+ * sinkron ke MongoDB, Redis cache, runtime storage, dan Git snapshot.
  */
 class FibVirtualWalkGraphService
 {
@@ -19,14 +23,25 @@ class FibVirtualWalkGraphService
     public const PANO_MAX_WIDTH = 4096;
     public const PANO_MAX_HEIGHT = 2048;
 
+    public function __construct(
+        protected ?string $runtimePathOverride = null,
+        protected ?string $snapshotPathOverride = null
+    ) {
+    }
+
     public function getRuntimePath(): string
     {
-        return storage_path('app/virtual-walk/fib_walk_graph.json');
+        return $this->runtimePathOverride ?: storage_path('app/virtual-walk/fib_walk_graph.json');
     }
 
     public function getSnapshotPath(): string
     {
-        return database_path('seeders/snapshots/fib_walk_graph.json');
+        return $this->snapshotPathOverride ?: database_path('seeders/snapshots/fib_walk_graph.json');
+    }
+
+    public function isUsingCustomPath(): bool
+    {
+        return $this->runtimePathOverride !== null || $this->snapshotPathOverride !== null;
     }
 
     /**
@@ -36,6 +51,41 @@ class FibVirtualWalkGraphService
      * @return array<string, mixed>
      */
     public function getGraph(bool $includeExcluded = false): array
+    {
+        $graph = null;
+
+        if (!$includeExcluded && !$this->isUsingCustomPath()) {
+            try {
+                $graph = Cache::remember(
+                    CampusRedisService::KEY_FIB_WALK_GRAPH,
+                    3600,
+                    fn (): array => $this->assembleGraph(false)
+                );
+            } catch (\Throwable $e) {
+                Log::debug('FibVirtualWalkGraphService Redis cache fallback: ' . $e->getMessage());
+            }
+        }
+
+        if ($graph === null) {
+            $graph = $this->assembleGraph($includeExcluded);
+        }
+
+        if (isset($graph['scenes']) && is_array($graph['scenes'])) {
+            foreach ($graph['scenes'] as &$scene) {
+                if (!empty($scene['storage_path'])) {
+                    $scene['image_url'] = asset('storage/' . ltrim((string) $scene['storage_path'], '/'));
+                }
+            }
+            unset($scene);
+        }
+
+        return $graph;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function assembleGraph(bool $includeExcluded): array
     {
         $raw = $this->loadRawGraph();
         $disk = Storage::disk('public');
@@ -484,13 +534,36 @@ class FibVirtualWalkGraphService
     }
 
     /**
-     * Muat raw JSON graf dari runtime, atau pulihkan dari snapshot Git, atau generate default.
+     * Muat raw JSON graf dari MongoDB (prioritas utama), atau pulihkan dari runtime / snapshot Git, atau generate default.
      *
      * @return array<string, mixed>
      */
     protected function loadRawGraph(): array
     {
         $runtime = $this->getRuntimePath();
+
+        if (!$this->isUsingCustomPath()) {
+            try {
+                $doc = FibVirtualWalkGraph::where('version', '>=', self::GRAPH_VERSION)
+                    ->orderByDesc('version')
+                    ->first();
+
+                if ($doc && !empty($doc->scenes)) {
+                    $diskSha1 = is_file($runtime) ? sha1_file($runtime) : null;
+                    $outOfBandRestore = app()->runningUnitTests()
+                        && $diskSha1 !== null
+                        && !empty($doc->json_sha1)
+                        && $diskSha1 !== $doc->json_sha1;
+
+                    if (!$outOfBandRestore) {
+                        return $doc->toRawGraph();
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::warning('FibVirtualWalkGraphService MongoDB load fallback to JSON: ' . $e->getMessage());
+            }
+        }
+
         if (is_file($runtime)) {
             $decoded = json_decode((string) file_get_contents($runtime), true);
             if (
@@ -498,6 +571,7 @@ class FibVirtualWalkGraphService
                 && !empty($decoded['scenes'])
                 && (int) ($decoded['version'] ?? 1) >= self::GRAPH_VERSION
             ) {
+                $this->persistToMongo($decoded, sha1_file($runtime) ?: null);
                 return $decoded;
             }
         }
@@ -511,6 +585,7 @@ class FibVirtualWalkGraphService
                 && (int) ($decoded['version'] ?? 1) >= self::GRAPH_VERSION
             ) {
                 $this->writeJsonAtomically($runtime, $decoded);
+                $this->persistToMongo($decoded, is_file($runtime) ? (sha1_file($runtime) ?: null) : null);
                 return $decoded;
             }
         }
@@ -522,14 +597,44 @@ class FibVirtualWalkGraphService
     }
 
     /**
-     * Simpan raw JSON ke kedua lokasi (runtime storage & Git snapshot).
+     * Simpan raw JSON ke kedua lokasi (runtime storage & Git snapshot), MongoDB, dan invalidate Redis cache.
      *
      * @param array<string, mixed> $raw
      */
     public function saveRawGraph(array $raw): void
     {
-        $this->writeJsonAtomically($this->getRuntimePath(), $raw);
+        $runtime = $this->getRuntimePath();
+        $this->writeJsonAtomically($runtime, $raw);
         $this->writeJsonAtomically($this->getSnapshotPath(), $raw);
+
+        if (!$this->isUsingCustomPath()) {
+            $this->persistToMongo($raw, is_file($runtime) ? (sha1_file($runtime) ?: null) : null);
+            app(CampusRedisService::class)->invalidateVirtualWalkCache();
+        }
+    }
+
+    /**
+     * Upsert graf virtual walk FIB ke MongoDB tanpa mematahkan alur utama bila MongoDB sementara tidak tersedia.
+     *
+     * @param array<string, mixed> $raw
+     */
+    public function persistToMongo(array $raw, ?string $jsonSha1 = null): void
+    {
+        if ($this->isUsingCustomPath()) {
+            return;
+        }
+
+        try {
+            $version = (int) ($raw['version'] ?? self::GRAPH_VERSION);
+            $payload = FibVirtualWalkGraph::fromRawGraph($raw, $jsonSha1);
+
+            FibVirtualWalkGraph::updateOrCreate(
+                ['version' => $version],
+                $payload
+            );
+        } catch (\Throwable $e) {
+            Log::warning('FibVirtualWalkGraphService MongoDB persist skipped: ' . $e->getMessage());
+        }
     }
 
     /**

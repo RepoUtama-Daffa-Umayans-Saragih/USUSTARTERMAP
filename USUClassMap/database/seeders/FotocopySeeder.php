@@ -56,90 +56,92 @@ class FotocopySeeder extends Seeder
             return;
         }
 
-        DB::statement('PRAGMA foreign_keys = OFF;');
+        DB::transaction(function () use ($storesData, $cashierFotokopi): void {
+            // Temporarily randomize existing slugs to prevent unique constraint conflict during re-mapping
+            foreach (DB::table('fotocopy_stores')->pluck('id') as $existingStoreId) {
+                DB::table('fotocopy_stores')
+                    ->where('id', $existingStoreId)
+                    ->update(['slug' => 'temp-' . $existingStoreId . '-' . Str::lower(Str::random(8))]);
+            }
 
-        // Temporarily randomize existing slugs to prevent unique constraint conflict during re-mapping
-        if (DB::table('fotocopy_stores')->count() > 0) {
-            DB::table('fotocopy_stores')->update([
-                'slug' => DB::raw("'temp-' || id || '-' || hex(randomblob(4))")
-            ]);
-        }
+            foreach ($storesData as $data) {
+                $id = $data['id'] ?? null;
+                $slug = $data['slug'] ?? Str::slug($data['name']);
 
-        foreach ($storesData as $data) {
-            $id = $data['id'] ?? null;
-            $slug = $data['slug'] ?? Str::slug($data['name']);
+                $startingPrice = 200;
+                if (!empty($data['catalog_items']) && is_array($data['catalog_items'])) {
+                    $prices = array_column($data['catalog_items'], 'price');
+                    if (!empty($prices)) {
+                        $startingPrice = min($prices);
+                    }
+                }
 
-            $startingPrice = 200;
-            if (!empty($data['catalog_items']) && is_array($data['catalog_items'])) {
-                $prices = array_column($data['catalog_items'], 'price');
-                if (!empty($prices)) {
-                    $startingPrice = min($prices);
+                $openHour = $data['open_time'] ?? '08:00';
+                $closeHour = $data['close_time'] ?? '21:00';
+                $openingHoursStr = "{$openHour} - {$closeHour}";
+
+                // Assign cashier to Store 5 (Berkah Abadi)
+                $isBerkah = ($id == 5) || str_contains($data['name'], 'Berkah Abadi');
+                $storeUserId = $isBerkah ? $cashierFotokopi->id : null;
+
+                $attrs = [
+                    'id' => $id,
+                    'user_id' => $storeUserId,
+                    'name' => $data['name'],
+                    'slug' => $slug,
+                    'location_name' => $data['location_name'],
+                    'latitude' => $data['latitude'],
+                    'longitude' => $data['longitude'],
+                    'opening_hours' => $openingHoursStr,
+                    'operating_days' => $data['operating_days'] ?? 'Senin - Sabtu',
+                    'phone' => $data['phone'] ?? null,
+                    'whatsapp' => $data['whatsapp'] ?? null,
+                    'image_url' => $data['image_url'] ?? null,
+                    'google_maps_url' => $data['google_maps_url'] ?? null,
+                    'google_place_id' => $data['google_place_id'] ?? null,
+                    'description' => $data['description'] ?? null,
+                    'rating' => $data['rating'] ?? 4.8,
+                    'user_rating_count' => $data['user_rating_count'] ?? 50,
+                    'is_open' => true,
+                    'starting_price' => $startingPrice,
+                    'updated_at' => now(),
+                ];
+
+                $existing = DB::table('fotocopy_stores')->where('id', $id)->first();
+                if ($existing) {
+                    DB::table('fotocopy_stores')->where('id', $id)->update($attrs);
+                } else {
+                    $attrs['created_at'] = now();
+                    DB::table('fotocopy_stores')->insert($attrs);
+                }
+
+                // Insert or update services
+                if (!empty($data['catalog_items']) && is_array($data['catalog_items'])) {
+                    foreach ($data['catalog_items'] as $item) {
+                        FotocopyService::updateOrCreate(
+                            [
+                                'store_id' => $id,
+                                'name' => $item['name'],
+                            ],
+                            [
+                                'category' => $item['category'] ?? 'Fotocopy',
+                                'price' => $item['price'] ?? 200,
+                                'unit' => $item['unit'] ?? 'lembar',
+                                'description' => $item['description'] ?? null,
+                                'is_available' => $item['is_available'] ?? true,
+                            ]
+                        );
+                    }
                 }
             }
+        });
 
-            $openHour = $data['open_time'] ?? '08:00';
-            $closeHour = $data['close_time'] ?? '21:00';
-            $openingHoursStr = "{$openHour} - {$closeHour}";
-
-            // Assign cashier to Store 5 (Berkah Abadi)
-            $isBerkah = ($id == 5) || str_contains($data['name'], 'Berkah Abadi');
-            $storeUserId = $isBerkah ? $cashierFotokopi->id : null;
-
-            $attrs = [
-                'id' => $id,
-                'user_id' => $storeUserId,
-                'name' => $data['name'],
-                'slug' => $slug,
-                'location_name' => $data['location_name'],
-                'latitude' => $data['latitude'],
-                'longitude' => $data['longitude'],
-                'opening_hours' => $openingHoursStr,
-                'operating_days' => $data['operating_days'] ?? 'Senin - Sabtu',
-                'phone' => $data['phone'] ?? null,
-                'whatsapp' => $data['whatsapp'] ?? null,
-                'image_url' => $data['image_url'] ?? null,
-                'google_maps_url' => $data['google_maps_url'] ?? null,
-                'google_place_id' => $data['google_place_id'] ?? null,
-                'description' => $data['description'] ?? null,
-                'rating' => $data['rating'] ?? 4.8,
-                'user_rating_count' => $data['user_rating_count'] ?? 50,
-                'is_open' => true,
-                'starting_price' => $startingPrice,
-                'updated_at' => now(),
-            ];
-
-            $existing = DB::table('fotocopy_stores')->where('id', $id)->first();
-            if ($existing) {
-                DB::table('fotocopy_stores')->where('id', $id)->update($attrs);
-            } else {
-                $attrs['created_at'] = now();
-                DB::table('fotocopy_stores')->insert($attrs);
-            }
-
-            // Insert or update services
-            if (!empty($data['catalog_items']) && is_array($data['catalog_items'])) {
-                foreach ($data['catalog_items'] as $item) {
-                    FotocopyService::updateOrCreate(
-                        [
-                            'store_id' => $id,
-                            'name' => $item['name'],
-                        ],
-                        [
-                            'category' => $item['category'] ?? 'Fotocopy',
-                            'price' => $item['price'] ?? 200,
-                            'unit' => $item['unit'] ?? 'lembar',
-                            'description' => $item['description'] ?? null,
-                            'is_available' => $item['is_available'] ?? true,
-                        ]
-                    );
-                }
-            }
+        if (DB::getDriverName() === 'pgsql') {
+            DB::statement("SELECT setval(pg_get_serial_sequence('fotocopy_stores', 'id'), COALESCE((SELECT MAX(id) FROM fotocopy_stores), 1), true)");
         }
-
-        DB::statement('PRAGMA foreign_keys = ON;');
 
         // 4. Seed sample orders on Berkah Abadi (Store ID 5) for cashier & reports testing
-        $berkahStore = FotocopyStore::find(5) ?? FotocopyStore::where('name', 'like', '%Berkah Abadi%')->first();
+        $berkahStore = FotocopyStore::find(5) ?? FotocopyStore::whereSearchLike('name', '%Berkah Abadi%')->first();
         if ($berkahStore) {
             $order1 = FotocopyOrder::updateOrCreate(
                 ['order_code' => 'ORD-20261113-0001'],

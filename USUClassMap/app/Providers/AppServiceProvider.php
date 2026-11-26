@@ -25,9 +25,12 @@ use App\Repositories\Eloquent\CourseRepository;
 use App\Repositories\Eloquent\LecturerRepository;
 use App\Repositories\Eloquent\RoomRepository;
 use App\Repositories\Eloquent\ScheduleRepository;
+use App\Services\Cache\CampusRedisService;
 use App\Services\GitSnapshotSyncService;
 use App\Services\RdfGeneratorService;
 use App\Services\SparqlService;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Pagination\Paginator;
 use Illuminate\Support\ServiceProvider;
 
@@ -58,6 +61,10 @@ class AppServiceProvider extends ServiceProvider
         $this->app->singleton(GitSnapshotSyncService::class, function () {
             return new GitSnapshotSyncService();
         });
+
+        $this->app->singleton(CampusRedisService::class, function () {
+            return new CampusRedisService();
+        });
     }
 
     /**
@@ -66,6 +73,28 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         Paginator::useTailwind();
+
+        QueryBuilder::macro('whereSearchLike', function (string $column, mixed $value, string $boolean = 'and') {
+            /** @var QueryBuilder $this */
+            $operator = $this->getConnection()->getDriverName() === 'pgsql' ? 'ilike' : 'like';
+            return $this->where($column, $operator, $value, $boolean);
+        });
+
+        QueryBuilder::macro('orWhereSearchLike', function (string $column, mixed $value) {
+            /** @var QueryBuilder $this */
+            return $this->whereSearchLike($column, $value, 'or');
+        });
+
+        EloquentBuilder::macro('whereSearchLike', function (string $column, mixed $value, string $boolean = 'and') {
+            /** @var EloquentBuilder $this */
+            $operator = $this->getModel()->getConnection()->getDriverName() === 'pgsql' ? 'ilike' : 'like';
+            return $this->where($column, $operator, $value, $boolean);
+        });
+
+        EloquentBuilder::macro('orWhereSearchLike', function (string $column, mixed $value) {
+            /** @var EloquentBuilder $this */
+            return $this->whereSearchLike($column, $value, 'or');
+        });
 
         // Model Observers
         Schedule::observe(ScheduleObserver::class);

@@ -95,6 +95,13 @@ return [
             'prefix_indexes' => true,
             'search_path' => 'public',
             'sslmode' => 'prefer',
+            'dont_drop' => ['spatial_ref_sys'],
+        ],
+
+        'mongodb' => [
+            'driver' => 'mongodb',
+            'dsn' => env('MONGODB_URI', 'mongodb://127.0.0.1:27017'),
+            'database' => env('MONGODB_DATABASE', 'usuclassmap_doc'),
         ],
 
         'sqlsrv' => [

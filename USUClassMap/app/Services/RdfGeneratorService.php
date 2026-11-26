@@ -162,8 +162,13 @@ class RdfGeneratorService
      *
      * @return bool True if upload succeeded, false otherwise
      */
-    public function uploadToFuseki(): bool
+    public function uploadToFuseki(bool $force = false): bool
     {
+        if (!$force && !config('sparql.auto_sync', true)) {
+            Log::debug('RDF Generator: Fuseki auto-sync is disabled via FUSEKI_SYNC_ENABLED.');
+            return false;
+        }
+
         if (!file_exists($this->rdfFilePath)) {
             $this->generate();
         }

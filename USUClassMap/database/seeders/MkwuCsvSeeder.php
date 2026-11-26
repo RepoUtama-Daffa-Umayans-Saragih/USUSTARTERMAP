@@ -27,23 +27,23 @@ class MkwuCsvSeeder extends Seeder
         $this->command->info("🚀 Memulai Import Data Jadwal MKWU dari CSV ({$csvPath})...");
 
         // Fallback default buildings
-        $gkb = Building::where('code', 'GKB')->orWhere('name', 'like', '%Kuliah Bersama%')->first()
+        $gkb = Building::where('code', 'GKB')->orWhereSearchLike('name', '%Kuliah Bersama%')->first()
             ?? Building::first();
-        $fib = Building::where('code', 'FIB')->orWhere('name', 'like', '%Ilmu Budaya%')->first()
+        $fib = Building::where('code', 'FIB')->orWhereSearchLike('name', '%Ilmu Budaya%')->first()
             ?? $gkb;
-        $fasilkom = Building::where('code', 'FASILKOM-TI')->orWhere('code', 'GD-FASILKOM')->orWhere('name', 'like', '%Komputer%')->first()
+        $fasilkom = Building::where('code', 'FASILKOM-TI')->orWhere('code', 'GD-FASILKOM')->orWhereSearchLike('name', '%Komputer%')->first()
             ?? $gkb;
-        $fk = Building::where('code', 'FK')->orWhere('name', 'like', '%Kedokteran%')->first()
+        $fk = Building::where('code', 'FK')->orWhereSearchLike('name', '%Kedokteran%')->first()
             ?? $gkb;
-        $fmipa = Building::where('code', 'FMIPA')->orWhere('name', 'like', '%MIPA%')->first()
+        $fmipa = Building::where('code', 'FMIPA')->orWhereSearchLike('name', '%MIPA%')->first()
             ?? $gkb;
-        $fp = Building::where('code', 'FP')->orWhere('name', 'like', '%Pertanian%')->first()
+        $fp = Building::where('code', 'FP')->orWhereSearchLike('name', '%Pertanian%')->first()
             ?? $gkb;
-        $fh = Building::where('code', 'FH')->orWhere('name', 'like', '%Hukum%')->first()
+        $fh = Building::where('code', 'FH')->orWhereSearchLike('name', '%Hukum%')->first()
             ?? $gkb;
-        $feb = Building::where('code', 'FEB')->orWhere('name', 'like', '%Ekonomi%')->first()
+        $feb = Building::where('code', 'FEB')->orWhereSearchLike('name', '%Ekonomi%')->first()
             ?? $gkb;
-        $fisip = Building::where('code', 'FISIP')->orWhere('name', 'like', '%Sosial%')->first()
+        $fisip = Building::where('code', 'FISIP')->orWhereSearchLike('name', '%Sosial%')->first()
             ?? $gkb;
 
         $handle = fopen($csvPath, 'r');

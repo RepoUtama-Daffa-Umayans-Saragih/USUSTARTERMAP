@@ -2,7 +2,13 @@
 
 namespace App\Services;
 
+use App\Jobs\RefreshMsbdMaterializedViewsJob;
+use App\Models\Mongo\CampusRoutingGraph;
+use App\Models\Mongo\FibVirtualWalkGraph;
+use App\Models\Photo360Calibration;
 use App\Observers\GitSnapshotObserver;
+use App\Services\Cache\CampusRedisService;
+use App\Services\Routing\CampusGraphBuilderService;
 use App\Services\VirtualWalk\FibVirtualWalkGraphService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -28,6 +34,32 @@ class GitSnapshotSyncService
         'fotocopy_services',
         'photocopy_items',
         'campus_routing_overrides',
+    ];
+
+    /**
+     * Kolom derived PostgreSQL yang tidak perlu diekspor/diimpor (diisi otomatis oleh trigger PG).
+     */
+    protected const PG_DERIVED_COLUMNS = [
+        'geom',
+        'entrance_geom',
+        'search_vector',
+    ];
+
+    protected const JSON_COLUMNS = [
+        'opening_hours',
+        'metadata',
+        'coordinates_json',
+        'metadata_json',
+        'photo_360_meta',
+    ];
+
+    protected const BOOLEAN_COLUMNS = [
+        'is_primary',
+        'is_open',
+        'is_active',
+        'is_verified',
+        'is_manually_verified',
+        'is_available',
     ];
 
     /**
@@ -121,97 +153,125 @@ class GitSnapshotSyncService
             return ['exported' => false, 'reason' => 'reentrant'];
         }
 
-        self::$isSyncing = true;
-
-        try {
-            $dir = $this->getSnapshotDir();
-            if (!is_dir($dir)) {
-                mkdir($dir, 0755, true);
+        return app(CampusRedisService::class)->withGitSyncLock(function () use ($regenerateRdf): array {
+            if (self::$isSyncing) {
+                return ['exported' => false, 'reason' => 'reentrant'];
             }
 
-            $counts = [];
-            $files = [];
+            self::$isSyncing = true;
 
-            foreach (self::TABLES as $table) {
-                if (!Schema::hasTable($table)) {
-                    continue;
+            try {
+                $dir = $this->getSnapshotDir();
+                if (!is_dir($dir)) {
+                    mkdir($dir, 0755, true);
                 }
 
-                $rows = DB::table($table)
-                    ->orderBy('id', 'asc')
-                    ->get()
-                    ->map(static fn ($row): array => (array) $row)
-                    ->values()
-                    ->all();
+                $counts = [];
+                $files = [];
 
-                $fileName = "{$table}.json";
-                $filePath = $dir . DIRECTORY_SEPARATOR . $fileName;
+                foreach (self::TABLES as $table) {
+                    if (!Schema::hasTable($table)) {
+                        continue;
+                    }
 
-                $this->writeJsonIfChanged($filePath, $rows);
+                    $rows = DB::table($table)
+                        ->orderBy('id', 'asc')
+                        ->get()
+                        ->map(function ($row): array {
+                            $arr = (array) $row;
+                            foreach (self::PG_DERIVED_COLUMNS as $derived) {
+                                unset($arr[$derived]);
+                            }
+                            return $arr;
+                        })
+                        ->values()
+                        ->all();
 
-                $counts[$table] = count($rows);
-                $files[] = $fileName;
+                    $fileName = "{$table}.json";
+                    $filePath = $dir . DIRECTORY_SEPARATOR . $fileName;
+
+                    $this->writeJsonIfChanged($filePath, $rows);
+
+                    $counts[$table] = count($rows);
+                    $files[] = $fileName;
+                }
+
+                // Pastikan photo_360_calibrations.json sinkron dengan PostgreSQL photo_360_calibrations
+                $calibrationsPath = $this->getCalibrationsPath();
+                $pgCalibrations = [];
+                if (Schema::hasTable('photo_360_calibrations')) {
+                    $pgCalibrations = Photo360Calibration::orderBy('filename')
+                        ->get(['filename', 'pitch', 'yaw'])
+                        ->map(static fn (Photo360Calibration $c): array => [
+                            'filename' => (string) $c->filename,
+                            'pitch' => (float) $c->pitch,
+                            'yaw' => (float) $c->yaw,
+                        ])
+                        ->values()
+                        ->all();
+                }
+
+                if (!empty($pgCalibrations)) {
+                    $this->writeJsonIfChanged($calibrationsPath, $pgCalibrations);
+                    $counts['photo_360_calibrations'] = count($pgCalibrations);
+                } elseif (!is_file($calibrationsPath)) {
+                    $initialCalibrations = $this->fetchPhotoCalibrationsFromFuseki();
+                    $this->writeJsonIfChanged($calibrationsPath, $initialCalibrations);
+                    $counts['photo_360_calibrations'] = count($initialCalibrations);
+                } else {
+                    $existingCalibrations = $this->readJsonFile($calibrationsPath);
+                    $counts['photo_360_calibrations'] = is_array($existingCalibrations) ? count($existingCalibrations) : 0;
+                }
+                $files[] = 'photo_360_calibrations.json';
+
+                // Salin atau regenerasi schedules.rdf ke snapshot Git
+                $rdfExported = $this->exportRdfSnapshot($regenerateRdf);
+                if ($rdfExported) {
+                    $files[] = 'schedules.rdf';
+                }
+
+                // Salin graf routing Kampus USU (jika sudah digenerate) ke snapshot Git
+                if ($this->exportRoutingGraphSnapshot()) {
+                    $files[] = 'campus_routing_graph.json';
+                }
+
+                // Salin graf Tur Virtual FIB 360° ke snapshot Git
+                if ($this->exportFibWalkGraphSnapshot()) {
+                    $files[] = 'fib_walk_graph.json';
+                }
+
+                // Hitung hash deterministik atas seluruh berkas JSON snapshot
+                $contentHash = $this->computeContentHash();
+
+                $manifestPath = $this->getManifestPath();
+                $existingManifest = $this->readJsonFile($manifestPath);
+                $previousHash = is_array($existingManifest) ? (string) ($existingManifest['content_hash'] ?? '') : '';
+
+                $manifestData = [
+                    'version' => 1,
+                    'generated_at' => ($previousHash === $contentHash && !empty($existingManifest['generated_at']))
+                        ? $existingManifest['generated_at']
+                        : now()->toIso8601String(),
+                    'content_hash' => $contentHash,
+                    'counts' => $counts,
+                    'files' => $files,
+                ];
+
+                $this->writeJsonIfChanged($manifestPath, $manifestData);
+
+                // Perbarui state lokal agar laptop pengekspor tidak mengimpor ulang hasil ekspornya sendiri
+                $this->writeLocalState($contentHash, 'export');
+
+                return [
+                    'exported' => true,
+                    'content_hash' => $contentHash,
+                    'counts' => $counts,
+                    'rdf_exported' => $rdfExported,
+                ];
+            } finally {
+                self::$isSyncing = false;
             }
-
-            // Pastikan photo_360_calibrations.json tersedia
-            $calibrationsPath = $this->getCalibrationsPath();
-            if (!is_file($calibrationsPath)) {
-                $initialCalibrations = $this->fetchPhotoCalibrationsFromFuseki();
-                $this->writeJsonIfChanged($calibrationsPath, $initialCalibrations);
-                $counts['photo_360_calibrations'] = count($initialCalibrations);
-            } else {
-                $existingCalibrations = $this->readJsonFile($calibrationsPath);
-                $counts['photo_360_calibrations'] = is_array($existingCalibrations) ? count($existingCalibrations) : 0;
-            }
-            $files[] = 'photo_360_calibrations.json';
-
-            // Salin atau regenerasi schedules.rdf ke snapshot Git
-            $rdfExported = $this->exportRdfSnapshot($regenerateRdf);
-            if ($rdfExported) {
-                $files[] = 'schedules.rdf';
-            }
-
-            // Salin graf routing Kampus USU (jika sudah digenerate) ke snapshot Git
-            if ($this->exportRoutingGraphSnapshot()) {
-                $files[] = 'campus_routing_graph.json';
-            }
-
-            // Salin graf Tur Virtual FIB 360° ke snapshot Git
-            if ($this->exportFibWalkGraphSnapshot()) {
-                $files[] = 'fib_walk_graph.json';
-            }
-
-            // Hitung hash deterministik atas seluruh berkas JSON snapshot
-            $contentHash = $this->computeContentHash();
-
-            $manifestPath = $this->getManifestPath();
-            $existingManifest = $this->readJsonFile($manifestPath);
-            $previousHash = is_array($existingManifest) ? (string) ($existingManifest['content_hash'] ?? '') : '';
-
-            $manifestData = [
-                'version' => 1,
-                'generated_at' => ($previousHash === $contentHash && !empty($existingManifest['generated_at']))
-                    ? $existingManifest['generated_at']
-                    : now()->toIso8601String(),
-                'content_hash' => $contentHash,
-                'counts' => $counts,
-                'files' => $files,
-            ];
-
-            $this->writeJsonIfChanged($manifestPath, $manifestData);
-
-            // Perbarui state lokal agar laptop pengekspor tidak mengimpor ulang hasil ekspornya sendiri
-            $this->writeLocalState($contentHash, 'export');
-
-            return [
-                'exported' => true,
-                'content_hash' => $contentHash,
-                'counts' => $counts,
-                'rdf_exported' => $rdfExported,
-            ];
-        } finally {
-            self::$isSyncing = false;
-        }
+        });
     }
 
     /**
@@ -257,6 +317,17 @@ class GitSnapshotSyncService
             $sorted = array_values($map);
 
             $this->writeJsonIfChanged($calibrationsPath, $sorted);
+
+            try {
+                if (Schema::hasTable('photo_360_calibrations')) {
+                    Photo360Calibration::updateOrCreate(
+                        ['filename' => $filename],
+                        ['pitch' => $pitch, 'yaw' => $yaw, 'updated_by' => auth()->id()]
+                    );
+                }
+            } catch (\Throwable $e) {
+                Log::warning('GitSnapshotSync: Gagal sinkron kalibrasi ke tabel photo_360_calibrations: ' . $e->getMessage());
+            }
 
             // Perbarui manifest.json jika sudah ada, atau lakukan export penuh jika belum ada
             $manifestPath = $this->getManifestPath();
@@ -351,118 +422,154 @@ class GitSnapshotSyncService
                     }
                 }
 
-                Schema::withoutForeignKeyConstraints(function () use ($payloads, $validUserIds, &$importedCounts, &$prunedCounts): void {
-                    DB::transaction(function () use ($payloads, $validUserIds, &$importedCounts, &$prunedCounts): void {
-                        // FASE 1: PRUNE (Child -> Parent) - hapus baris lokal yang tidak ada lagi di snapshot Git
-                        foreach (array_reverse(self::TABLES) as $table) {
-                            if (!array_key_exists($table, $payloads)) {
-                                continue;
-                            }
+                $isPgsql = DB::getDriverName() === 'pgsql';
 
-                            $rows = $payloads[$table];
-                            $snapshotIds = [];
-                            foreach ($rows as $row) {
-                                if (is_array($row) && array_key_exists('id', $row) && $row['id'] !== null) {
-                                    $snapshotIds[] = $row['id'];
-                                }
-                            }
+                DB::transaction(function () use ($payloads, $validUserIds, $isPgsql, &$importedCounts, &$prunedCounts): void {
+                    // FASE 1: PRUNE (Child -> Parent) - hapus baris lokal yang tidak ada lagi di snapshot Git
+                    foreach (array_reverse(self::TABLES) as $table) {
+                        if (!array_key_exists($table, $payloads)) {
+                            continue;
+                        }
 
-                            if (empty($snapshotIds)) {
-                                $prunedCounts[$table] = DB::table($table)->delete();
-                            } else {
-                                $localIds = DB::table($table)->pluck('id')->all();
-                                $idsToDelete = array_values(array_diff($localIds, $snapshotIds));
-                                $deletedTotal = 0;
-
-                                foreach (array_chunk($idsToDelete, 500) as $chunk) {
-                                    $deletedTotal += DB::table($table)->whereIn('id', $chunk)->delete();
-                                }
-
-                                $prunedCounts[$table] = $deletedTotal;
+                        $rows = $payloads[$table];
+                        $snapshotIds = [];
+                        foreach ($rows as $row) {
+                            if (is_array($row) && array_key_exists('id', $row) && $row['id'] !== null) {
+                                $snapshotIds[] = $row['id'];
                             }
                         }
 
-                        // FASE 2: UPSERT (Parent -> Child) - sinkronkan seluruh data & kolom
-                        foreach (self::TABLES as $table) {
-                            if (!array_key_exists($table, $payloads)) {
+                        if (empty($snapshotIds)) {
+                            $prunedCounts[$table] = DB::table($table)->delete();
+                        } else {
+                            $localIds = DB::table($table)->pluck('id')->all();
+                            $idsToDelete = array_values(array_diff($localIds, $snapshotIds));
+                            $deletedTotal = 0;
+
+                            foreach (array_chunk($idsToDelete, 500) as $chunk) {
+                                $deletedTotal += DB::table($table)->whereIn('id', $chunk)->delete();
+                            }
+
+                            $prunedCounts[$table] = $deletedTotal;
+                        }
+                    }
+
+                    // FASE 2: UPSERT (Parent -> Child) - sinkronkan seluruh data & kolom
+                    foreach (self::TABLES as $table) {
+                        if (!array_key_exists($table, $payloads)) {
+                            continue;
+                        }
+
+                        $rows = $payloads[$table];
+                        if (empty($rows)) {
+                            $importedCounts[$table] = 0;
+                            continue;
+                        }
+
+                        $tableColumns = array_values(array_diff(
+                            Schema::getColumnListing($table),
+                            self::PG_DERIVED_COLUMNS
+                        ));
+                        if (empty($tableColumns)) {
+                            continue;
+                        }
+                        $columnSet = array_flip($tableColumns);
+
+                        // Sanitasi setiap baris terhadap skema kolom aktual di database lokal
+                        $sanitizedRows = [];
+                        foreach ($rows as $row) {
+                            if (!is_array($row)) {
                                 continue;
                             }
 
-                            $rows = $payloads[$table];
-                            if (empty($rows)) {
-                                $importedCounts[$table] = 0;
-                                continue;
+                            $filtered = [];
+                            foreach ($tableColumns as $col) {
+                                if (array_key_exists($col, $row)) {
+                                    $value = $row[$col];
+                                    if (is_array($value) || is_object($value)) {
+                                        $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                                    }
+                                    if ($isPgsql && in_array($col, self::JSON_COLUMNS, true) && $value === '') {
+                                        $value = null;
+                                    }
+                                    if ($isPgsql && in_array($col, self::BOOLEAN_COLUMNS, true) && $value !== null) {
+                                        $value = (bool) $value;
+                                    }
+                                    $filtered[$col] = $value;
+                                }
                             }
 
-                            $tableColumns = Schema::getColumnListing($table);
-                            if (empty($tableColumns)) {
-                                continue;
+                            // Pastikan FK opsional fotocopy_stores.user_id aman di laptop tujuan
+                            if ($table === 'fotocopy_stores' && array_key_exists('user_id', $filtered) && $filtered['user_id'] !== null) {
+                                if (!isset($validUserIds[$filtered['user_id']])) {
+                                    $filtered['user_id'] = null;
+                                }
                             }
-                            $columnSet = array_flip($tableColumns);
 
-                            // Sanitasi setiap baris terhadap skema kolom aktual di database lokal
-                            $sanitizedRows = [];
-                            foreach ($rows as $row) {
-                                if (!is_array($row)) {
+                            // Pastikan FK opsional campus_routing_overrides.created_by aman di laptop tujuan
+                            if ($table === 'campus_routing_overrides' && array_key_exists('created_by', $filtered) && $filtered['created_by'] !== null) {
+                                if (!isset($validUserIds[$filtered['created_by']])) {
+                                    $filtered['created_by'] = null;
+                                }
+                            }
+
+                            if (!empty($filtered)) {
+                                $sanitizedRows[] = $filtered;
+                            }
+                        }
+
+                        if (empty($sanitizedRows)) {
+                            $importedCounts[$table] = 0;
+                            continue;
+                        }
+
+                        // Resolusi bentrok kolom UNIQUE (mis. jika 2 baris bertukar code/slug)
+                        if (isset(self::UNIQUE_COLUMNS[$table])) {
+                            foreach (self::UNIQUE_COLUMNS[$table] as $uniqueCol) {
+                                if (!isset($columnSet[$uniqueCol])) {
                                     continue;
                                 }
-
-                                $filtered = [];
-                                foreach ($tableColumns as $col) {
-                                    if (array_key_exists($col, $row)) {
-                                        $value = $row[$col];
-                                        if (is_array($value) || is_object($value)) {
-                                            $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-                                        }
-                                        $filtered[$col] = $value;
-                                    }
-                                }
-
-                                // Pastikan FK opsional fotocopy_stores.user_id aman di laptop tujuan
-                                if ($table === 'fotocopy_stores' && array_key_exists('user_id', $filtered) && $filtered['user_id'] !== null) {
-                                    if (!isset($validUserIds[$filtered['user_id']])) {
-                                        $filtered['user_id'] = null;
-                                    }
-                                }
-
-                                // Pastikan FK opsional campus_routing_overrides.created_by aman di laptop tujuan
-                                if ($table === 'campus_routing_overrides' && array_key_exists('created_by', $filtered) && $filtered['created_by'] !== null) {
-                                    if (!isset($validUserIds[$filtered['created_by']])) {
-                                        $filtered['created_by'] = null;
-                                    }
-                                }
-
-                                if (!empty($filtered)) {
-                                    $sanitizedRows[] = $filtered;
-                                }
+                                $this->resolveUniqueCollisions($table, $uniqueCol, $sanitizedRows);
                             }
-
-                            if (empty($sanitizedRows)) {
-                                $importedCounts[$table] = 0;
-                                continue;
-                            }
-
-                            // Resolusi bentrok kolom UNIQUE (mis. jika 2 baris bertukar code/slug)
-                            if (isset(self::UNIQUE_COLUMNS[$table])) {
-                                foreach (self::UNIQUE_COLUMNS[$table] as $uniqueCol) {
-                                    if (!isset($columnSet[$uniqueCol])) {
-                                        continue;
-                                    }
-                                    $this->resolveUniqueCollisions($table, $uniqueCol, $sanitizedRows);
-                                }
-                            }
-
-                            // Pastikan seluruh baris punya set key yang seragam untuk upsert batch
-                            $upsertColumns = array_keys($sanitizedRows[0]);
-                            $updateColumns = array_values(array_diff($upsertColumns, ['id']));
-
-                            foreach (array_chunk($sanitizedRows, 50) as $chunk) {
-                                DB::table($table)->upsert($chunk, ['id'], $updateColumns);
-                            }
-
-                            $importedCounts[$table] = count($sanitizedRows);
                         }
-                    });
+
+                        // Pastikan seluruh baris punya set key yang seragam untuk upsert batch
+                        $upsertColumns = array_keys($sanitizedRows[0]);
+                        $updateColumns = array_values(array_diff($upsertColumns, ['id']));
+
+                        foreach (array_chunk($sanitizedRows, 50) as $chunk) {
+                            DB::table($table)->upsert($chunk, ['id'], $updateColumns);
+                        }
+
+                        $importedCounts[$table] = count($sanitizedRows);
+                    }
+
+                    // Sinkronkan kalibrasi pitch/yaw 360 ke tabel photo_360_calibrations
+                    $calibrationsPath = $this->getCalibrationsPath();
+                    if (Schema::hasTable('photo_360_calibrations') && is_file($calibrationsPath)) {
+                        $calibrations = $this->readJsonFile($calibrationsPath);
+                        if (is_array($calibrations)) {
+                            $calCount = 0;
+                            foreach ($calibrations as $item) {
+                                if (!is_array($item) || empty($item['filename'])) {
+                                    continue;
+                                }
+                                Photo360Calibration::updateOrCreate(
+                                    ['filename' => (string) $item['filename']],
+                                    [
+                                        'pitch' => (float) ($item['pitch'] ?? 0.0),
+                                        'yaw' => (float) ($item['yaw'] ?? 0.0),
+                                    ]
+                                );
+                                $calCount++;
+                            }
+                            $importedCounts['photo_360_calibrations'] = $calCount;
+                        }
+                    }
+
+                    if ($isPgsql) {
+                        DB::select('SELECT * FROM fn_reset_all_pk_sequences()');
+                    }
                 });
 
                 // FASE 3: Regenerasi RDF & Sinkronisasi ke Apache Jena Fuseki (tidak menggagalkan import DB jika Fuseki mati)
@@ -481,6 +588,23 @@ class GitSnapshotSyncService
 
                 $this->importRoutingGraphSnapshot();
                 $this->importFibWalkGraphSnapshot();
+
+                try {
+                    $redis = app(CampusRedisService::class);
+                    $redis->invalidateBuildingCaches();
+                    $redis->invalidatePhotocopyCaches();
+                    $redis->invalidateVirtualWalkCache();
+                } catch (\Throwable $e) {
+                    Log::warning('GitSnapshotSync: Gagal invalidasi Redis cache setelah impor: ' . $e->getMessage());
+                }
+
+                if ($isPgsql) {
+                    try {
+                        RefreshMsbdMaterializedViewsJob::dispatch('all');
+                    } catch (\Throwable $e) {
+                        Log::warning('GitSnapshotSync: Gagal dispatch RefreshMsbdMaterializedViewsJob setelah impor: ' . $e->getMessage());
+                    }
+                }
 
                 // FASE 4: Catat state lokal agar tidak ter-impor ulang pada request berikutnya
                 $this->writeLocalState($manifestHash, 'import');
@@ -507,15 +631,7 @@ class GitSnapshotSyncService
             }
         };
 
-        try {
-            $lock = Cache::lock('git_snapshot_sync_lock', 30);
-
-            return $lock->block(5, $executeImport);
-        } catch (\Throwable $e) {
-            Log::warning('GitSnapshotSync: Cache lock tidak tersedia atau timeout, menjalankan impor langsung: ' . $e->getMessage());
-
-            return $executeImport();
-        }
+        return app(CampusRedisService::class)->withGitSyncLock($executeImport);
     }
 
     /**
@@ -523,6 +639,10 @@ class GitSnapshotSyncService
      */
     public function syncPhotoCalibrationsToFuseki(): int
     {
+        if (!config('sparql.auto_sync', true)) {
+            return 0;
+        }
+
         $calibrationsPath = $this->getCalibrationsPath();
         if (!is_file($calibrationsPath)) {
             return 0;
@@ -704,6 +824,16 @@ SPARQL;
                 }
             }
 
+            try {
+                $doc = CampusRoutingGraph::where('is_active', true)->orderByDesc('generated_at')->first();
+                if ($doc) {
+                    $this->writeJsonIfChanged($snapshot, $doc->toGraphArray());
+                    return true;
+                }
+            } catch (\Throwable $e) {
+                Log::warning('GitSnapshotSync: Gagal fallback MongoDB exportRoutingGraphSnapshot: ' . $e->getMessage());
+            }
+
             return is_file($snapshot);
         } catch (\Throwable $e) {
             Log::warning('GitSnapshotSync: Gagal mengekspor snapshot campus_routing_graph.json: ' . $e->getMessage());
@@ -712,7 +842,7 @@ SPARQL;
     }
 
     /**
-     * Pulihkan graf routing Kampus USU dari snapshot Git ke runtime storage jika lebih baru / belum ada.
+     * Pulihkan graf routing Kampus USU dari snapshot Git ke runtime storage & MongoDB jika lebih baru / belum ada.
      */
     protected function importRoutingGraphSnapshot(): void
     {
@@ -737,6 +867,23 @@ SPARQL;
             if (!is_file($runtime) || file_get_contents($runtime) !== $content) {
                 file_put_contents($runtime, $content, LOCK_EX);
             }
+
+            $decoded = json_decode($content, true);
+            if (is_array($decoded) && !empty($decoded['nodes'])) {
+                try {
+                    $activeDoc = CampusRoutingGraph::where('is_active', true)->orderByDesc('generated_at')->first();
+                    $activeIso = is_array($activeDoc?->meta) ? ($activeDoc->meta['generated_at_iso'] ?? null) : null;
+                    $snapshotIso = $decoded['generated_at'] ?? null;
+
+                    if (!$activeDoc || ($snapshotIso !== null && $activeIso !== $snapshotIso)) {
+                        app(CampusGraphBuilderService::class)->persistToMongo($decoded);
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning('GitSnapshotSync: Gagal menyinkronkan campus_routing_graphs ke MongoDB: ' . $e->getMessage());
+                }
+            }
+
+            app(CampusRedisService::class)->invalidateRoutingCache();
         } catch (\Throwable $e) {
             Log::warning('GitSnapshotSync: Gagal mengimpor snapshot campus_routing_graph.json: ' . $e->getMessage());
         }
@@ -751,10 +898,6 @@ SPARQL;
             $runtime = $this->getFibWalkGraphRuntimePath();
             $snapshot = $this->getFibWalkGraphSnapshotPath();
 
-            if (!is_file($runtime) && !is_file($snapshot)) {
-                app(FibVirtualWalkGraphService::class)->getGraph(false);
-            }
-
             if (is_file($runtime)) {
                 $content = file_get_contents($runtime);
                 if ($content !== false && $content !== '') {
@@ -762,6 +905,29 @@ SPARQL;
                         file_put_contents($snapshot, $content, LOCK_EX);
                     }
                     return true;
+                }
+            }
+
+            try {
+                $doc = FibVirtualWalkGraph::orderByDesc('version')->first();
+                if ($doc) {
+                    $this->writeJsonIfChanged($snapshot, $doc->toRawGraph());
+                    return true;
+                }
+            } catch (\Throwable $e) {
+                Log::warning('GitSnapshotSync: Gagal fallback MongoDB exportFibWalkGraphSnapshot: ' . $e->getMessage());
+            }
+
+            if (!is_file($snapshot)) {
+                app(FibVirtualWalkGraphService::class)->getGraph(false);
+                if (is_file($runtime)) {
+                    $content = file_get_contents($runtime);
+                    if ($content !== false && $content !== '') {
+                        if (!is_file($snapshot) || file_get_contents($snapshot) !== $content) {
+                            file_put_contents($snapshot, $content, LOCK_EX);
+                        }
+                        return true;
+                    }
                 }
             }
 
@@ -773,7 +939,7 @@ SPARQL;
     }
 
     /**
-     * Pulihkan graf Tur Virtual FIB 360° dari snapshot Git ke runtime storage.
+     * Pulihkan graf Tur Virtual FIB 360° dari snapshot Git ke runtime storage & MongoDB.
      */
     protected function importFibWalkGraphSnapshot(): void
     {
@@ -798,6 +964,22 @@ SPARQL;
             if (!is_file($runtime) || file_get_contents($runtime) !== $content) {
                 file_put_contents($runtime, $content, LOCK_EX);
             }
+
+            $decoded = json_decode($content, true);
+            if (is_array($decoded) && !empty($decoded['scenes'])) {
+                $sha1 = sha1($content);
+                $version = (int) ($decoded['version'] ?? FibVirtualWalkGraphService::GRAPH_VERSION);
+                try {
+                    $existing = FibVirtualWalkGraph::where('version', $version)->first();
+                    if (!$existing || $existing->json_sha1 !== $sha1) {
+                        app(FibVirtualWalkGraphService::class)->persistToMongo($decoded, $sha1);
+                    }
+                } catch (\Throwable $e) {
+                    Log::warning('GitSnapshotSync: Gagal menyinkronkan fib_walk_graphs ke MongoDB: ' . $e->getMessage());
+                }
+            }
+
+            app(CampusRedisService::class)->invalidateVirtualWalkCache();
         } catch (\Throwable $e) {
             Log::warning('GitSnapshotSync: Gagal mengimpor snapshot fib_walk_graph.json: ' . $e->getMessage());
         }

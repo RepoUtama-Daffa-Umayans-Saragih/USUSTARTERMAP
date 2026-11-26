@@ -2,10 +2,14 @@
 
 namespace App\Services\Search;
 
+use App\Models\Mongo\SearchAnalyticsLog;
 use App\Models\PhotocopyItem;
 use App\Models\PhotocopyPlace;
+use App\Services\Cache\CampusRedisService;
 use App\Services\OperationalStatusService;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 /**
  * Engine 2: SmartPhotocopySearchService
@@ -36,6 +40,7 @@ class SmartPhotocopySearchService
      */
     public function search(string $query, array $options = []): array
     {
+        $startedAt = microtime(true);
         $parsed = $options['parsed'] ?? $this->intentParser->parse($query);
 
         $sort = $this->normalizeSort($options['sort'] ?? null);
@@ -83,34 +88,9 @@ class SmartPhotocopySearchService
         $coreQueryTokens = array_values(array_diff($itemTerms, ['fotocopy', 'atk']));
         $lexicalTokens = array_values(array_diff($allSearchTokens, $noise));
 
-        // 2. Load active catalog items & cache store open status + distance metrics once per store
-        $items = PhotocopyItem::query()
-            ->with('place')
-            ->where('is_available', true)
-            ->whereHas('place', fn ($q) => $q->where('is_active', true))
-            ->get();
-
-        $placeMetrics = [];
-        foreach ($items as $item) {
-            $place = $item->place;
-            if (!$place) {
-                continue;
-            }
-            if (!isset($placeMetrics[$place->id])) {
-                $placeMetrics[$place->id] = $this->computePlaceMetrics($place, $anchorLat, $anchorLng);
-            }
-        }
-
-        foreach ($allActivePlaces as $p) {
-            if (!isset($placeMetrics[$p->id])) {
-                $placeMetrics[$p->id] = $this->computePlaceMetrics($p, $anchorLat, $anchorLng);
-            }
-        }
-
-        // 3. Determine 3-mode search intent & evaluate matching items/stores
+        // 2. Determine 3-mode search intent up front so PostgreSQL can pre-filter candidates via MV/pg_trgm
         $exactMatches = [];
         $relaxedMatches = [];
-        $itemsByPlace = $items->groupBy('photocopy_place_id');
         $isEmptyQuery = trim($query) === '';
         $hasSpecificProduct = (bool) ($parsed['has_specific_product_intent'] ?? (!empty($coreQueryTokens) || !empty($attributes)));
         $hasSpecificLocOrStore = ($anchorSource === 'landmark')
@@ -130,10 +110,58 @@ class SmartPhotocopySearchService
         }
 
         $evaluateItemsDirect = $hasSpecificProduct || (!$isEmptyQuery && (!empty($coreQueryTokens) || !empty($attributes))) || ($maxPrice !== null && $maxPrice > 0 && $searchMode !== 'store');
+        $matchTokens = !empty($coreQueryTokens) ? $coreQueryTokens : $lexicalTokens;
+
+        // L1 Redis GEO / L2 PostGIS spatial pre-lookup when running on PostgreSQL
+        $geoDistances = $this->fetchGeoDistancesPg($anchorLat, $anchorLng);
+
+        // Pre-filter catalog candidates from mv_catalog_search_index (FTS + pg_trgm + ILIKE) on PostgreSQL
+        $usedMvPrefilter = false;
+        $prefilteredIds = ($evaluateItemsDirect && !$isEmptyQuery && (!empty($matchTokens) || !empty($attributes)))
+            ? $this->prefilterCatalogItemIdsPg($matchTokens, $attributes, $matchedPlaceIds, $maxPrice)
+            : [];
+
+        if (!empty($prefilteredIds)) {
+            $items = PhotocopyItem::query()
+                ->with('place')
+                ->whereIn('id', $prefilteredIds)
+                ->where('is_available', true)
+                ->whereHas('place', fn ($q) => $q->where('is_active', true))
+                ->get();
+            $usedMvPrefilter = $items->isNotEmpty();
+        } else {
+            $items = collect();
+        }
+
+        if ($items->isEmpty()) {
+            $items = PhotocopyItem::query()
+                ->with('place')
+                ->where('is_available', true)
+                ->whereHas('place', fn ($q) => $q->where('is_active', true))
+                ->get();
+            $usedMvPrefilter = false;
+        }
+
+        $itemsByPlace = $items->groupBy('photocopy_place_id');
+
+        $placeMetrics = [];
+        foreach ($items as $item) {
+            $place = $item->place;
+            if (!$place) {
+                continue;
+            }
+            if (!isset($placeMetrics[$place->id])) {
+                $placeMetrics[$place->id] = $this->computePlaceMetrics($place, $anchorLat, $anchorLng, $geoDistances[$place->id] ?? null);
+            }
+        }
+
+        foreach ($allActivePlaces as $p) {
+            if (!isset($placeMetrics[$p->id])) {
+                $placeMetrics[$p->id] = $this->computePlaceMetrics($p, $anchorLat, $anchorLng, $geoDistances[$p->id] ?? null);
+            }
+        }
 
         if ($evaluateItemsDirect) {
-            $matchTokens = !empty($coreQueryTokens) ? $coreQueryTokens : $lexicalTokens;
-
             foreach ($items as $item) {
                 $place = $item->place;
                 if (!$place) {
@@ -195,6 +223,16 @@ class SmartPhotocopySearchService
         $relaxedFallbackUsed = false;
         $missingAttributes = [];
         $advisoryNote = null;
+
+        if ($usedMvPrefilter && empty($exactMatches) && empty($relaxedMatches)) {
+            $items = PhotocopyItem::query()
+                ->with('place')
+                ->where('is_available', true)
+                ->whereHas('place', fn ($q) => $q->where('is_active', true))
+                ->get();
+            $itemsByPlace = $items->groupBy('photocopy_place_id');
+            $usedMvPrefilter = false;
+        }
 
         if (!empty($exactMatches)) {
             $pool = $exactMatches;
@@ -261,6 +299,19 @@ class SmartPhotocopySearchService
             $isSpecificShop
         );
 
+        // When pre-filtered via MV, hydrate full items only for qualified stores so starting_price & tags match 100%
+        if ($usedMvPrefilter && !empty($ranked)) {
+            $qualifiedPlaceIds = array_values(array_unique(array_map(
+                static fn (array $r): int => (int) $r['place']->id,
+                $ranked
+            )));
+            $itemsByPlace = PhotocopyItem::query()
+                ->whereIn('photocopy_place_id', $qualifiedPlaceIds)
+                ->where('is_available', true)
+                ->get(['id', 'photocopy_place_id', 'category', 'item_type', 'price'])
+                ->groupBy('photocopy_place_id');
+        }
+
         // When mode is 'mixed' with a landmark, scope mixed_groups & store directory to nearby/matching campus stores
         $mixedGroups = $searchMode === 'mixed'
             ? $this->buildMixedGroups(
@@ -319,7 +370,7 @@ class SmartPhotocopySearchService
             $highlightTerms
         );
 
-        return [
+        $response = [
             'status'                => 'success',
             'query'                 => $query,
             'search_mode'           => $searchMode,
@@ -347,6 +398,16 @@ class SmartPhotocopySearchService
             'stores'                => $storesSummary,
             'mixed_groups'          => $mixedGroups,
         ];
+
+        $this->recordAnalyticsLog($query, $searchMode, $anchorSource === 'gps', count($formattedResults), $startedAt, [
+            'sort' => $sort,
+            'open_now' => $openNowFilter,
+            'max_price' => $maxPrice,
+            'mv_prefiltered' => $usedMvPrefilter,
+            'exact_match_count' => count($exactMatches),
+        ]);
+
+        return $response;
     }
 
     /**
@@ -467,12 +528,18 @@ class SmartPhotocopySearchService
      *
      * @return array<string, mixed>
      */
-    protected function computePlaceMetrics(PhotocopyPlace $place, float $anchorLat, float $anchorLng): array
-    {
+    protected function computePlaceMetrics(
+        PhotocopyPlace $place,
+        float $anchorLat,
+        float $anchorLng,
+        ?float $precomputedDistance = null
+    ): array {
         $pLat = (float) ($place->entrance_lat ?: $place->latitude ?: self::USU_CENTER_LAT);
         $pLng = (float) ($place->entrance_lng ?: $place->longitude ?: self::USU_CENTER_LNG);
 
-        $distanceMeters = (int) round($this->haversine($anchorLat, $anchorLng, $pLat, $pLng));
+        $distanceMeters = $precomputedDistance !== null
+            ? (int) round($precomputedDistance)
+            : (int) round($this->haversine($anchorLat, $anchorLng, $pLat, $pLng));
         $walkMinutes = max(1, (int) ceil($distanceMeters / 75));
         $opStatus = app(OperationalStatusService::class)->evaluatePhotocopyStatus($place);
 
@@ -1742,5 +1809,139 @@ class SmartPhotocopySearchService
         $a = sin($dLat / 2) ** 2 + cos(deg2rad($lat1)) * cos(deg2rad($lat2)) * sin($dLng / 2) ** 2;
 
         return $earthRadius * 2 * atan2(sqrt($a), sqrt(max(0.0, 1 - $a)));
+    }
+
+    /**
+     * Query L1 Redis GEO or L2 PostGIS fn_find_nearby_photocopy_places() for distances in meters.
+     *
+     * @return array<int, float>
+     */
+    protected function fetchGeoDistancesPg(float $lat, float $lng): array
+    {
+        if (DB::getDriverName() !== 'pgsql') {
+            return [];
+        }
+
+        $geo = app(CampusRedisService::class)->findNearbyWithDistances(
+            CampusRedisService::KEY_GEO_PLACES,
+            $lat,
+            $lng,
+            15000,
+            100
+        );
+        if (!empty($geo)) {
+            return $geo;
+        }
+
+        try {
+            $rows = DB::select(
+                'SELECT id, distance_m FROM fn_find_nearby_photocopy_places(?, ?, ?, ?)',
+                [$lat, $lng, 15000, 100]
+            );
+            $out = [];
+            foreach ($rows as $row) {
+                $out[(int) $row->id] = (float) $row->distance_m;
+            }
+            return $out;
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    /**
+     * Pre-filter candidate item IDs from mv_catalog_search_index via FTS + pg_trgm + ILIKE.
+     *
+     * @param  array<int, string>  $matchTokens
+     * @param  array<int, string>  $attributes
+     * @param  array<int, int>  $matchedPlaceIds
+     * @return array<int, int>
+     */
+    protected function prefilterCatalogItemIdsPg(
+        array $matchTokens,
+        array $attributes,
+        array $matchedPlaceIds,
+        ?int $maxPrice
+    ): array {
+        if (DB::getDriverName() !== 'pgsql') {
+            return [];
+        }
+
+        $tokenExpansions = [
+            'correction' => ['correction', 'tipe-x', 'tip-x', 'tipex', 'stipo'],
+            'highlighter' => ['highlighter', 'stabilo'],
+            'stopmap' => ['stopmap', 'stofmap', 'map ', 'snelhecter'],
+            'sticky' => ['sticky', 'post-it', 'postit'],
+        ];
+
+        $terms = !empty($matchTokens) ? $matchTokens : $attributes;
+        if (empty($terms) && empty($matchedPlaceIds)) {
+            return [];
+        }
+
+        $expandedCandidates = [];
+        foreach ($terms as $tok) {
+            foreach ($tokenExpansions[$tok] ?? [$tok] as $cand) {
+                $clean = trim((string) $cand);
+                if ($clean !== '') {
+                    $expandedCandidates[] = $clean;
+                }
+            }
+        }
+        $expandedCandidates = array_values(array_unique($expandedCandidates));
+
+        try {
+            $q = DB::table('mv_catalog_search_index')
+                ->where('is_available', true)
+                ->where('place_active', true);
+
+            if ($maxPrice !== null) {
+                $q->where('price', '<=', $maxPrice);
+            }
+
+            $q->where(function ($sub) use ($expandedCandidates, $matchedPlaceIds): void {
+                foreach ($expandedCandidates as $cand) {
+                    $like = "%{$cand}%";
+                    $sub->orWhereRaw("search_vector @@ plainto_tsquery('indonesian', unaccent(?))", [$cand])
+                        ->orWhereRaw('name % ?', [$cand])
+                        ->orWhere('name', 'ilike', $like)
+                        ->orWhere('brand', 'ilike', $like)
+                        ->orWhere('sub_category', 'ilike', $like)
+                        ->orWhere('category', 'ilike', $like)
+                        ->orWhere('place_name', 'ilike', $like);
+                }
+
+                if (!empty($matchedPlaceIds)) {
+                    $sub->orWhereIn('photocopy_place_id', $matchedPlaceIds);
+                }
+            });
+
+            return array_values(array_unique(array_map('intval', $q->pluck('item_id')->all())));
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    protected function recordAnalyticsLog(
+        string $query,
+        string $mode,
+        bool $hasGps,
+        int $resultCount,
+        float $startedAt,
+        array $meta = []
+    ): void {
+        try {
+            SearchAnalyticsLog::create([
+                'endpoint' => '/api/fotocopy/smart-search',
+                'query' => $query,
+                'detected_mode' => $mode,
+                'has_gps' => $hasGps,
+                'result_count' => $resultCount,
+                'latency_ms' => max(0, (int) round((microtime(true) - $startedAt) * 1000)),
+                'meta' => $meta,
+                'expires_at' => now()->addDays(SearchAnalyticsLog::TTL_DAYS),
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('SmartPhotocopySearchService SearchAnalyticsLog skipped: ' . $e->getMessage());
+        }
     }
 }

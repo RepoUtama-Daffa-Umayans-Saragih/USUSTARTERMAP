@@ -33,7 +33,7 @@ class GenerateRdfCommand extends Command
 
         if ($this->option('upload') || config('sparql.fuseki_url')) {
             $this->info('Uploading RDF graph to Apache Jena Fuseki dataset...');
-            $uploaded = $rdfService->uploadToFuseki();
+            $uploaded = $rdfService->uploadToFuseki((bool) $this->option('upload'));
 
             if ($uploaded) {
                 $this->info('Fuseki upload successful!');

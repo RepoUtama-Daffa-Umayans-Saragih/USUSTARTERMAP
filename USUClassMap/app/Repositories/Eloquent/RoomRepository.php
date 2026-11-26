@@ -18,9 +18,9 @@ class RoomRepository extends BaseRepository implements RoomRepositoryInterface
 
         if ($keyword) {
             $query->where(function ($q) use ($keyword) {
-                $q->where('name', 'like', "%{$keyword}%")
+                $q->whereSearchLike('name', "%{$keyword}%")
                   ->orWhereHas('building', function ($q) use ($keyword) {
-                      $q->where('name', 'like', "%{$keyword}%");
+                      $q->whereSearchLike('name', "%{$keyword}%");
                   });
             });
         }

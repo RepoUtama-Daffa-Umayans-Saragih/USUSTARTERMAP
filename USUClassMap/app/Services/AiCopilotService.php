@@ -40,6 +40,7 @@ class AiCopilotService
     protected array $lastActions = [];
     protected ?string $lastAdvisoryNote = null;
     protected array $lastRuntimeContext = [];
+    protected array $lastToolCalls = [];
 
     protected QueryIntentParserService $intentParser;
     protected SmartPhotocopySearchService $photocopySearch;
@@ -183,6 +184,16 @@ class AiCopilotService
         $this->spatialResolver = $spatialResolver ?? app(SpatialLandmarkResolverService::class);
     }
 
+    public function getLastToolCalls(): array
+    {
+        return $this->lastToolCalls;
+    }
+
+    protected function recordToolCall(string $name, array $meta = []): void
+    {
+        $this->lastToolCalls[] = array_merge(['tool' => $name], $meta);
+    }
+
     /**
      * Eksekusi percakapan Tanya Ucup dengan arsitektur Local-First Grounded Engines
      * + optional ClassAI Router enrichment (zero HTTP 500 bila offline/key kosong).
@@ -204,6 +215,7 @@ class AiCopilotService
         $this->lastActions = [];
         $this->lastAdvisoryNote = null;
         $this->lastRuntimeContext = $runtimeContext;
+        $this->lastToolCalls = [];
 
         // 0. Guardrail Read-Only (mencegah modifikasi jadwal lewat AI)
         if (preg_match('/\b(hapus|delete|tambah|insert|buatkan\s+jadwal|update|ubah|ganti|drop|kprs|edit\s+jadwal)\b/i', $userMessage)
@@ -504,6 +516,8 @@ class AiCopilotService
      */
     protected function handleGroundedPhotocopyChat(string $userMessage, array $parsedIntent, array $runtimeContext): array
     {
+        $this->recordToolCall('cari_fotokopi_atk', ['query' => $userMessage]);
+
         $search = $this->photocopySearch->search($userMessage, [
             'parsed' => $parsedIntent,
             'lat'    => $runtimeContext['user_lat'] ?? null,
@@ -587,6 +601,8 @@ class AiCopilotService
      */
     protected function handleGroundedSpatialChat(string $userMessage, array $parsedIntent, array $runtimeContext): array
     {
+        $this->recordToolCall('tebak_gedung_spasial', ['query' => $userMessage]);
+
         $resolved = $this->spatialResolver->resolve($userMessage, [
             'parsed' => $parsedIntent,
             'limit'  => 5,
@@ -666,6 +682,8 @@ class AiCopilotService
      */
     protected function handleGroundedRouteChat(string $userMessage, array $parsedIntent, array $runtimeContext): array
     {
+        $this->recordToolCall('route_navigation', ['query' => $userMessage]);
+
         // If photocopy item or shop mentioned, route to best matching fotocopy
         if (!empty($parsedIntent['item_terms']) || preg_match('/\b(fotocopy|percetakan|atk)\b/i', $userMessage)) {
             $fc = $this->handleGroundedPhotocopyChat($userMessage, $parsedIntent, $runtimeContext);
@@ -846,7 +864,7 @@ class AiCopilotService
             }
         }
 
-        // 3. Pencarian Jadwal via toolCariJadwalKuliah (mendukung carry-over history + SPARQL/SQLite)
+        // 3. Pencarian Jadwal via toolCariJadwalKuliah (mendukung carry-over history + SPARQL/PostgreSQL)
         $keyword = !empty($parsedIntent['course_terms'])
             ? implode(' ', $parsedIntent['course_terms'])
             : ($parsedUser['core_keyword'] ?? '');
@@ -891,7 +909,7 @@ class AiCopilotService
                     'schedules'       => $this->lastSchedules,
                     'quick_replies'   => $this->lastQuickReplies,
                     'map_actions'     => $this->lastMapActions,
-                    'grounded_source' => 'sparql_sqlite_grounded',
+                    'grounded_source' => 'sparql_relational_grounded',
                     'usage'           => null,
                 ];
             }
@@ -1191,6 +1209,8 @@ PROMPT;
      */
     protected function executeTool(string $toolName, array $input): array
     {
+        $this->recordToolCall($toolName, $input);
+
         return match ($toolName) {
             'cari_jadwal_kuliah'     => $this->toolCariJadwalKuliah($input),
             'detail_gedung'          => $this->toolDetailGedung($input),
@@ -1663,9 +1683,9 @@ PROMPT;
         $building = Building::with(['rooms' => function ($q) {
             $q->orderBy('floor')->orderBy('name');
         }])
-            ->where('name', 'LIKE', "%{$query}%")
-            ->orWhere('code', 'LIKE', "%{$query}%")
-            ->orWhere('faculty', 'LIKE', "%{$query}%")
+            ->whereSearchLike('name', "%{$query}%")
+            ->orWhereSearchLike('code', "%{$query}%")
+            ->orWhereSearchLike('faculty', "%{$query}%")
             ->first();
 
         if (!$building) {
@@ -1707,8 +1727,8 @@ PROMPT;
         }
 
         $lecturers = Lecturer::with(['schedules.course', 'schedules.room.building'])
-            ->where('name', 'LIKE', "%{$nama}%")
-            ->orWhere('nip', 'LIKE', "%{$nama}%")
+            ->whereSearchLike('name', "%{$nama}%")
+            ->orWhereSearchLike('nip', "%{$nama}%")
             ->limit(3)
             ->get();
 

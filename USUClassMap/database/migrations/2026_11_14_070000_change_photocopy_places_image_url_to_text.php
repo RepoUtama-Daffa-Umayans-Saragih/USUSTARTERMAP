@@ -16,7 +16,8 @@ return new class extends Migration
 
     public function down(): void
     {
-        if (DB::table('photocopy_places')->whereRaw('CHAR_LENGTH(image_url) > 255')->exists()) {
+        $lenFn = DB::getDriverName() === 'sqlite' ? 'LENGTH' : 'CHAR_LENGTH';
+        if (DB::table('photocopy_places')->whereRaw("{$lenFn}(image_url) > 255")->exists()) {
             throw new RuntimeException('Cannot shorten photocopy image URLs to 255 characters without data loss.');
         }
 
